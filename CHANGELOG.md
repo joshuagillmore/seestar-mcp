@@ -46,6 +46,18 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   defense in depth against a future level change reopening the leak. Pinned by
   `tests/test_logging_redaction.py`. **If MCP or journald logs from before this fix have
   left the machine, rotate the meteoblue key.**
+- `deploy/seestar-mcp.service` had trailing `# comment` text on seven hardening directives
+  (`ProtectSystem`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables`,
+  `ProtectControlGroups`, `MemoryDenyWriteExecute`). systemd only treats `#`/`;` as a comment
+  marker at the start of a line; mid-line it becomes part of the directive's value, which
+  systemd rejects with only a log warning, silently dropping the directive. Without
+  `ProtectSystem=strict` in particular, `ReadWritePaths` confined nothing. Comments moved
+  onto their own line above each directive; the unit's header now notes to run
+  `systemd-analyze verify` and `systemd-analyze security seestar-mcp` after deploy. Pinned by
+  `tests/test_deploy_unit.py`. The other deploy files (`deploy/docker/*`,
+  `deploy/dawn_park_watchdog.sh`) were scanned for the same problem and are clean: Dockerfile,
+  YAML, TOML and bash comments all behave as their authors intended, unlike systemd's
+  ini-like format.
 
 ## [0.1.0] - 2026-07-05
 
