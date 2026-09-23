@@ -99,8 +99,13 @@ class SeestarController:
         #: clock (see CLAUDE.md), and this needs one.
         self._weather_cache: tuple[tuple, float, Any] | None = None
 
+        # Per-session state.
+        self.session_id: str | None = None
+        self.manifest: SessionManifest | None = None
+        self.target: str | None = None
+
     async def _weather_cached(self, site, window, illum):
-        """Weather assessment, reused within ``qa_weather_cache_ttl_s``.
+        """Weather assessment, reused within ``weather_cache_ttl_s``.
 
         Why this exists: ``check_night_guardrails`` consumes exactly ONE value
         from the assessment — the tri-state ``weather_go`` — but each call used
@@ -134,11 +139,6 @@ class SeestarController:
         ttl = max(0.0, float(self.settings.weather_cache_ttl_s))
         self._weather_cache = (key, now + ttl, value)
         return value
-
-        # Per-session state.
-        self.session_id: str | None = None
-        self.manifest: SessionManifest | None = None
-        self.target: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> SeestarController:

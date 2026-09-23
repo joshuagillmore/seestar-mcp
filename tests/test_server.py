@@ -133,6 +133,26 @@ async def test_connect_telescope_maps_alpaca_error_to_ok_false():
     assert "InvalidOperation" in result["error"]
 
 
+def test_fresh_controller_has_session_state_attrs():
+    # Regression: commit df15a67 inserted `_weather_cached` in the middle of
+    # __init__, leaving `session_id`/`manifest`/`target` as unreachable code
+    # after `_weather_cached`'s `return value` — a fresh controller never set
+    # them (2026-09-22 review remediation, task 2).
+    ctrl = _controller_with_mock_alpaca(AsyncMock())
+    assert ctrl.session_id is None
+    assert ctrl.manifest is None
+    assert ctrl.target is None
+
+
+async def test_qa_session_report_does_not_raise_on_a_fresh_controller():
+    # Same regression as above: qa_session_report reads self.target, which did
+    # not exist on a controller that had not yet run goto_target in-process
+    # (e.g. right after a server restart), raising AttributeError.
+    ctrl = _controller_with_mock_alpaca(AsyncMock())
+    result = await ctrl.qa_session_report(paths=[])
+    assert isinstance(result, dict)
+
+
 async def test_goto_target_maps_alpaca_error_to_ok_false(tmp_path):
     from seestar_mcp.config import Settings
 
