@@ -950,11 +950,18 @@ class SeestarController:
             t = find_target(target)
             if t is None:
                 return {"ok": False, "error": f"unknown target: {target}"}
-            obs = observability(site, t, when)
+            # Named as a field, not just prose (2026-09-22 review, Task 7): the
+            # caller cannot otherwise confirm which night this observability was
+            # computed over, now that `date=None` re-anchors to the upcoming
+            # night. Computed once and handed to observability() below instead
+            # of letting it recompute the same window.
+            window = dark_window(site, when)
+            obs = observability(site, t, when, dark_window_utc=window)
             return {
                 "ok": True,
                 "target": dataclasses.asdict(t),
                 "observability": dataclasses.asdict(obs),
+                "dark_window_utc": window,
             }
         except Exception as exc:  # noqa: BLE001 - tool-facing never-raise contract
             return {"ok": False, "error": str(exc)}
@@ -1017,6 +1024,13 @@ class SeestarController:
             projects = (
                 load_projects(self._projects_path()) if prefer_projects else None
             )
+            # Same window already computed above for the weather assessment
+            # (site_for_engine only strips the horizon mask — dark_window
+            # depends solely on lat/lon/elevation, so it is identical to
+            # site's) — hand it to rank_targets instead of letting it, or the
+            # up-to-120 catalog targets under it, recompute it (2026-09-22
+            # review, Task 7: that took 120x `observability` from 8.1s to
+            # 11.1s once Task 6 widened dark_window's Sun grid).
             plans = rank_targets(
                 site_for_engine,
                 when,
@@ -1025,6 +1039,7 @@ class SeestarController:
                 types=types,
                 min_alt=min_alt,
                 limit=limit,
+                dark_window_utc=window,
                 projects=projects,
                 now_utc=when,
                 recent_days=avoid_recent_days,
@@ -1032,6 +1047,7 @@ class SeestarController:
             return {
                 "ok": True,
                 "location": block,
+                "dark_window_utc": window,
                 "conditions": {
                     "go": conditions.go,
                     "suitability": conditions.suitability,

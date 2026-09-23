@@ -305,6 +305,7 @@ def observability(
     site: SiteProfile,
     target: DsoTarget,
     when_utc: str | Time,
+    dark_window_utc: tuple[str, str] | None = None,
 ) -> Observability:
     """Full :class:`Observability` for ``target`` over the night's dark window.
 
@@ -314,9 +315,17 @@ def observability(
     mask via :func:`is_blocked`). Adds transit geometry, moon separation /
     altitude / illumination at transit, and the field-rotation-limited usable sub
     length. Never raises: on any error it returns a zeroed record.
+
+    ``dark_window_utc``, if given, is used as the ``(dusk_iso, dawn_iso)`` pair
+    instead of calling :func:`dark_window` again — ADDITIVE and optional
+    (2026-09-22 review, Task 7): ``rank_targets`` computes the window once per
+    call and hands it to every target instead of each of 120 catalog targets
+    recomputing it (dark_window went 33 -> 64ms once Task 6 widened its Sun
+    grid, taking 120x `observability` from 8.1s to 11.1s). ``None`` (the
+    default) reproduces the prior behaviour exactly.
     """
     try:
-        return _observability(site, target, when_utc)
+        return _observability(site, target, when_utc, dark_window_utc)
     except Exception:  # noqa: BLE001 - never-raise contract; degrade to a zeroed record
         return _empty_observability(target.id if target is not None else "unknown")
 
@@ -325,9 +334,12 @@ def _observability(
     site: SiteProfile,
     target: DsoTarget,
     when_utc: str | Time,
+    dark_window_utc: tuple[str, str] | None = None,
 ) -> Observability:
     loc = _location(site)
-    dusk_iso, dawn_iso = dark_window(site, when_utc)
+    dusk_iso, dawn_iso = (
+        dark_window_utc if dark_window_utc is not None else dark_window(site, when_utc)
+    )
     dusk = _to_time(dusk_iso)
     dawn = _to_time(dawn_iso)
 

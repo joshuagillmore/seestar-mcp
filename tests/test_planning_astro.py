@@ -194,3 +194,44 @@ def test_high_summer_site_really_takes_the_fallback():
 
     _, alt = _sun_alt_grid(HIGH_SUMMER, _to_time(planning_when(HIGH_SUMMER, "2026-06-21")))
     assert alt.min() > -18.0
+
+
+# --- observability(..., dark_window_utc=...): additive, skips recompute -------
+# Task 7 (2026-09-22 review): dark_window recomputed once per target inside
+# observability took 120x `observability` in rank_targets from 8.1s to 11.1s
+# after Task 6 widened the Sun grid. dark_window_utc lets a caller that already
+# has the window (rank_targets, computing it once for the whole catalog) hand it
+# straight to observability instead.
+
+
+def test_observability_dark_window_utc_none_matches_old_output():
+    site = SiteProfile(name="x", lat_deg=40.0, lon_deg=-74.0, bortle=6)
+    t = find_target("M27")
+    when = "2026-07-05T04:00:00Z"
+    old = observability(site, t, when)
+    new = observability(site, t, when, dark_window_utc=None)
+    assert new == old
+
+
+def test_observability_precomputed_window_skips_recompute_and_matches(monkeypatch):
+    import seestar_mcp.planning.astro as astro_mod
+
+    site = SiteProfile(name="x", lat_deg=40.0, lon_deg=-74.0, bortle=6)
+    t = find_target("M27")
+    when = "2026-07-05T04:00:00Z"
+
+    baseline = observability(site, t, when)
+    window = dark_window(site, when)
+
+    real_dark_window = astro_mod.dark_window
+    calls: list[int] = []
+
+    def _counting(*a, **k):
+        calls.append(1)
+        return real_dark_window(*a, **k)
+
+    monkeypatch.setattr(astro_mod, "dark_window", _counting)
+    obs = observability(site, t, when, dark_window_utc=window)
+
+    assert calls == [], "observability must not recompute dark_window when it is given"
+    assert obs == baseline

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
-from .astro import Observability, observability
+from .astro import Observability, dark_window, observability
 from .lightpollution import bortle_for, lp_suitability
 
 if TYPE_CHECKING:
@@ -294,6 +294,7 @@ def rank_targets(
     types: list[str] | None = None,
     min_alt: float | None = None,
     limit: int | None = None,
+    dark_window_utc: tuple[str, str] | None = None,
     observability_fn: Callable[..., Observability] = observability,
     projects: dict[str, Project] | None = None,
     now_utc: str | None = None,
@@ -310,6 +311,15 @@ def rank_targets(
     go/no-go verdict does not exclude targets (planning still runs on a no-go
     night — the caller annotates the caveat). Never raises.
 
+    **Dark window, computed once (2026-09-22 review, Task 7):** the night's
+    ``(dusk, dawn)`` pair is resolved ONCE per call — from ``dark_window_utc`` if
+    the caller already has it (``plan_targets`` needs the same window for its
+    weather assessment), else freshly via :func:`~.astro.dark_window` — and
+    passed to every ``observability_fn`` call as its own ``dark_window_utc``
+    rather than letting each of up to 120 catalog targets recompute it (that
+    took 120x `observability` from 8.1s to 11.1s after Task 6 widened
+    ``dark_window``'s Sun grid).
+
     **Project-awareness (optional, backward-compatible):** when ``projects`` (a
     ``{target_id: Project}`` map, already loaded — this function never reads
     disk) is supplied, an active project still short of its goal gets a bounded
@@ -324,10 +334,16 @@ def rank_targets(
             wanted = set(types)
             selected = [t for t in catalog if t.type in wanted]
 
+        window = (
+            dark_window_utc
+            if dark_window_utc is not None
+            else dark_window(site, when_utc)
+        )
+
         plans: list[TargetPlan] = []
         for target in selected:
             try:
-                obs = observability_fn(site, target, when_utc)
+                obs = observability_fn(site, target, when_utc, dark_window_utc=window)
             except Exception:  # noqa: BLE001 - a bad target must not sink the batch
                 continue
             if obs.dark_minutes_in_sweet_band <= 0:

@@ -237,6 +237,39 @@ def test_plan_targets_with_mocked_engine(tmp_path, monkeypatch):
     assert "observability" not in t
 
 
+def test_plan_targets_returns_dark_window_utc_and_threads_it_to_the_ranker(
+    tmp_path, monkeypatch
+):
+    # Task 7 (2026-09-22 review): plan_targets already computes the window for
+    # its weather assessment — it must surface that SAME window as a top-level
+    # field (the rule "if a tool names a quantity, return it as a field") and
+    # pass it to rank_targets instead of letting the ranker recompute it.
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
+
+    monkeypatch.setattr(server_mod, "dark_window", lambda site, when: ("a", "b"))
+    monkeypatch.setattr(server_mod, "moon_illumination", lambda when: 0.1)
+    monkeypatch.setattr(server_mod, "load_catalog", lambda: [])
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        return _canned_conditions()
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
+
+    captured = {}
+
+    def _fake_rank(*a, **k):
+        captured.update(k)
+        return [_canned_plan()]
+
+    monkeypatch.setattr(server_mod, "rank_targets", _fake_rank)
+
+    r = asyncio.run(c.plan_targets())
+    assert r["ok"] is True
+    assert r["dark_window_utc"] == ("a", "b")
+    assert captured["dark_window_utc"] == ("a", "b")
+
+
 def test_plan_targets_compact_and_project_aware(tmp_path, monkeypatch):
     c = _controller(tmp_path)
     assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
@@ -305,6 +338,37 @@ def test_unknown_target(tmp_path):
     r = asyncio.run(c.get_target_observability("NotARealObject"))
     assert r["ok"] is False
     assert "unknown target" in r["error"].lower()
+
+
+def test_get_target_observability_returns_dark_window_utc_and_threads_it(
+    tmp_path, monkeypatch
+):
+    # Task 7 (2026-09-22 review): the tool must name the night it planned as a
+    # field, and hand the window it computed straight to observability() rather
+    # than letting observability() recompute it.
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
+
+    monkeypatch.setattr(server_mod, "dark_window", lambda site, when: ("a", "b"))
+
+    captured = {}
+
+    def _fake_observability(site, target, when, dark_window_utc=None):
+        captured["dark_window_utc"] = dark_window_utc
+        return Observability(
+            target_id=target.id, max_alt_deg=50.0, transit_utc="2026-07-05T04:00:00Z",
+            rise_utc=None, set_utc=None, dark_minutes_above_floor=100.0,
+            dark_minutes_in_sweet_band=80.0, field_rotation_deg_per_hr_at_transit=10.0,
+            usable_sub_minutes=40.0, transits_above_ceiling=False, moon_sep_deg=90.0,
+            moon_alt_deg=20.0, moon_illum_frac=0.1, best_window_utc=("a", "b"),
+        )
+
+    monkeypatch.setattr(server_mod, "observability", _fake_observability)
+
+    r = asyncio.run(c.get_target_observability("M27"))
+    assert r["ok"] is True
+    assert r["dark_window_utc"] == ("a", "b")
+    assert captured["dark_window_utc"] == ("a", "b")
 
 
 # --- Autonomous-night tools (simulate_night / check_night_guardrails) -------
