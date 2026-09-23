@@ -286,7 +286,41 @@ times because the grid step is ~5 min):**
 - All existing astro, ranker, planning-tools and console-contract tests stay green
   without changing their assertions. If one must change, stop and report why instead.
 
-## Task 7: Skills: fail-closed guardrail, native park confirmation, autonomous weather-stop precedence
+## Task 7: Compute the planning night once per ranking, and surface it
+
+**Finding (introduced by Task 6, measured by its reviewer):** `rank_targets`
+(`planning/ranker.py` ~line 330) calls `observability(site, target, when)` once per catalog
+target (120), and each call recomputes `dark_window(site, when)` inside `_observability`
+(`planning/astro.py`). Task 6 widened the sun grid to ±24 h. That took `dark_window` from
+33 to 64 ms and 120 × `observability` from 8.1 to 11.1 s on a desktop (+37%). The Jetson
+that runs this from a phone is slower. Computing the window once and passing it in
+measured **3.98 s, with byte-identical results**. Separately, `plan_targets` and
+`get_target_observability` do not report which night they planned. Since Task 6,
+`date=None` re-anchors to the upcoming night, so a caller cannot confirm the night from the
+output. That breaks the rule "if a tool names a quantity, return it as a field".
+
+**Requirements:**
+1. `observability(site, target, when_utc, dark_window_utc=None)` gets an ADDITIVE, optional
+   parameter. When it is given (a `(dusk_iso, dawn_iso)` pair), `_observability` uses it
+   and does not call `dark_window`. When it is `None`, behaviour is exactly as today.
+2. `rank_targets` computes `dark_window(site, when)` ONCE per call and passes it to every
+   `observability` call. Its public signature stays unchanged, or changes only additively.
+3. Tests, written first:
+   - A regression test proving `rank_targets` output is identical with and without the
+     precomputed window: for a fixed site, instant and small catalog slice, compare
+     against per-target `observability(..., dark_window_utc=None)`.
+   - A test that `dark_window` is called exactly once per `rank_targets` call (count it
+     with monkeypatch).
+   - A test that `observability(..., dark_window_utc=None)` still matches its old output.
+4. `plan_targets` and `get_target_observability` gain an ADDITIVE top-level
+   `dark_window_utc` field: the `(dusk, dawn)` pair of the night they actually planned, in
+   the same ISO format `assess_conditions` already returns. Test both. `simulate_night`
+   already returns `dark_window_utc`; check that it is unchanged.
+5. Measure before and after in the report: 120 × `observability` via `rank_targets`, and one
+   `plan_targets` call with weather mocked.
+6. Nothing in `planning/` may read the clock. All existing assertions stay unchanged.
+
+## Task 8: Skills: fail-closed guardrail, native park confirmation, autonomous weather-stop precedence
 
 **Findings:**
 - `skills/autonomous-night/SKILL.md` Phase B step 1 (~lines 113-118) goes to Phase C only
@@ -336,3 +370,20 @@ times because the grid step is ~5 min):**
    `date` semantics from Task 6.
 6. Keep each skill's existing voice and structure. Make minimal, surgical edits and don't
    rewrite sections. Do not change thresholds or procedures beyond these items.
+7. Keep the docs in step with Tasks 5-7:
+   - `docs/CONTRACT.md`: MINOR bump to **v1.2.0** (its rule 3: adding a key is MINOR).
+     Update the title, the Version row and the Changelog, following the existing entry
+     style. Record:
+     - Task 5's `get_status` keys `mount_parked` / `mount_tracking` (bool or null, from
+       native `mount.close` / `mount.tracking`).
+     - Task 7's `dark_window_utc` on `plan_targets` and `get_target_observability`.
+     - Task 6's change to how `date` is read on the covered planning tools: a bare date is
+       the night beginning that evening, and an omitted date plans the upcoming night. No
+       key, unit or frame changed.
+     If the contract lists `get_status` keys anywhere, add the two new keys there as well.
+   - `skills/run-session/SKILL.md` (~line 343) says `get_status` makes 5 device calls. It
+     now makes 6, because Task 5 added one native `get_device_state` call.
+   - `CLAUDE.md`: make the test count in the Toolchain section ("300 tests") match
+     `uv run pytest --collect-only -q | tail -1` at the time you edit it.
+   - Optional, one line in observing-planner if it fits naturally: a project's "imaged N
+     days ago" is now counted from the planned night, not the wall clock.
