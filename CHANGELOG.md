@@ -35,6 +35,18 @@ device paths are not yet hardware-validated (see the README "Status & limitation
 - README: added "Status & limitations", "Prerequisites", and "Legal & trademarks" sections.
 - Scrubbed personal data (real LAN IP / username) from tracked source and docs.
 
+### Security
+- The meteoblue API key no longer reaches stderr / journald. `FastMCP("seestar-mcp")`
+  configures the root logger at INFO with a RichHandler, and httpx logs every request at
+  INFO as `HTTP Request: GET <full-url> ...` — the keyed weather fetch
+  (`planning/weather.py`) carries the key as the `apikey` query param, so it was landing in
+  Claude Code's MCP logs, or journald on the Jetson. `server.py` now raises the
+  `httpx`/`httpcore` loggers to WARNING right after `FastMCP(...)`, and a `logging.Filter`
+  attached to the `httpx` logger redacts any `apikey=<value>` that still gets through, as
+  defense in depth against a future level change reopening the leak. Pinned by
+  `tests/test_logging_redaction.py`. **If MCP or journald logs from before this fix have
+  left the machine, rotate the meteoblue key.**
+
 ## [0.1.0] - 2026-07-05
 
 Initial build (pre-public): auditable `seestar-mcp` FastMCP server (33 tools) driving a ZWO

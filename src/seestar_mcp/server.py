@@ -29,6 +29,7 @@ from __future__ import annotations
 import time
 import dataclasses
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1683,6 +1684,47 @@ def _parse_battery(info: Any) -> float | None:
 # ===========================================================================
 
 mcp = FastMCP("seestar-mcp")
+
+# Task 3 (2026-09-22 review remediation): FastMCP.__init__() just called the mcp
+# package's configure_logging("INFO"), which is logging.basicConfig(level=INFO,
+# handlers=[RichHandler(stderr)]) on the ROOT logger. httpx logs every request at
+# INFO as `HTTP Request: GET <full-url> "HTTP/1.1 200 OK"`, and the meteoblue
+# weather source (planning/weather.py) carries SEESTAR_METEOBLUE_API_KEY as the
+# `apikey` query param, so every keyed weather fetch was writing the key to
+# stderr -- and so to Claude Code's MCP logs, or journald on the Jetson. This is
+# distinct from the provenance log, which already redacts the key (see
+# provenance.py / SECURITY.md). Raising the httpx/httpcore loggers above INFO
+# silences the request-line log at the source.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _RedactApiKeyFilter(logging.Filter):
+    """Defense in depth for the leak above: strip `apikey=<value>` from any
+    record the httpx logger emits, independent of its level.
+
+    A future change that lowers the httpx logger back to INFO/DEBUG (or a
+    library path that logs the URL at WARNING+) must not silently re-open the
+    leak; this filter keeps the key out regardless. See
+    tests/test_logging_redaction.py, which pins both layers.
+    """
+
+    _PATTERN = re.compile(r"(apikey=)[^&\s\"]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1***REDACTED***", record.msg)
+        if record.args:
+            record.args = tuple(
+                self._PATTERN.sub(r"\1***REDACTED***", str(arg))
+                if self._PATTERN.search(str(arg))
+                else arg
+                for arg in record.args
+            )
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactApiKeyFilter())
 
 _controller: SeestarController | None = None
 
