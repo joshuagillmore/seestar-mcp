@@ -319,8 +319,8 @@ the session run quietly.
    Then state the updated project progress in one line:
    `M31 logged: +25 min → 3.0 h of 6 h.`
 5. If the user is done for the night, `park` the mount and confirm the fold:
-   `get_status.mount_parked` is `true` (poll briefly — the fold takes a moment). Not
-   `tracking`, which is Alpaca's view and disagrees with the device on this hardware.
+   `get_status.mount_parked` is `true` (poll for up to ~4 min; the fold takes 1–3 min).
+   Not `tracking`, which is Alpaca's view and disagrees with the device on this hardware.
    `shutdown` only if they ask — shutdown ends the seestar_alp link.
 
 ## Hard rules

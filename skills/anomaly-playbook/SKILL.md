@@ -20,10 +20,12 @@ layer captures commands; add a one-line human-readable note).
 During a run the user started through **`autonomous-night`** (its dry run plus explicit
 "go" pre-authorises parking at dawn or on any hard stop), a `check_night_guardrails`
 hard stop or a confirmed weather no-go **parks without asking**: go straight to
-`autonomous-night` Phase C, then notify. Nobody may be awake to answer, and rain does not
-wait. The "always ask first" rules below apply to **attended** sessions only. Everything
-else here still holds — diagnose first, one retry, and ask before anything the dry run
-did not show (a new field, the dew heater, a mask edit).
+`autonomous-night` Phase C, then notify. A confirmed weather no-go means
+`assess_conditions` returned `go: false`; cloud rising while `go` is still `true` (or
+`null`) does not end an autonomous night on its own. Nobody may be awake to answer, and
+rain does not wait. The "always ask first" rules below apply to **attended** sessions
+only. Everything else here still holds — diagnose first, one retry, and ask before
+anything the dry run did not show (a new field, the dew heater, a mask edit).
 
 ## Triage order
 When multiple symptoms appear at once, diagnose in this order, because earlier items
@@ -86,7 +88,7 @@ False, or cloud cover rising in the forecast, while a session is live.
   logging the session), and `park` the mount to get the optics horizontal.
 - Pausing, winding down, and parking are all state-changing — in an **attended** session,
   **always ask first**; never auto-abort on weather. In an authorised autonomous night the
-  precedence rule at the top applies instead: park without asking.
+  precedence rule at the top applies instead: park without asking on `go: false`.
 
 ## Symptom: goto seems stuck (but may be a normal alignment)
 Likely cause: the normal `Initialise`/`3PPA` alignment the firmware runs on a goto, which

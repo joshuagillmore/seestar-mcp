@@ -145,23 +145,34 @@ Record the run's `session_start_utc` at first go-ahead. Then, for each target:
    the loop. If it is an **unrecoverable fault or a hard guardrail stop**, go to Phase C
    — end in `park`. Re-check guardrails on any anomaly, not just at slot boundaries.
    The Phase A go-ahead already authorised that park: a hard stop or a confirmed weather
-   no-go parks **without asking** (the playbook's precedence rule) — never block on a
-   question nobody is awake to answer.
+   no-go (`assess_conditions` returned `go: false`) parks **without asking** (the
+   playbook's precedence rule) — never block on a question nobody is awake to answer.
+   Cloud rising while `go` is still `true` (or `null`) is not a no-go and does not end
+   the night on its own.
 
 ## Phase C — Wind down + park
 Reached on any hard stop, unrecoverable fault, end of schedule, or user stop. Fold the
 mount before the bookkeeping: logging is local and can wait, the weather cannot.
-1. `stop_view` to end stacking cleanly.
+1. `stop_view` to end stacking cleanly. **Go on to `park` whatever it returns** — a
+   native error now comes back `ok: false`, and a failed `stop_view` must never stall
+   the wind-down.
 2. **`park`** the mount (stops tracking, optics to horizontal). Parking is
    non-negotiable on any hard stop.
-3. **Confirm the fold — a `park` reply is not proof.** Poll `get_status` a few times
-   over ~1–2 min until `mount_parked` is `true`. Read `mount_parked` (the device's own
-   `mount.close`), never `tracking` — that is Alpaca's view and disagrees with the
-   device on this hardware; `mount_parked: null` means the native read failed, which
-   confirms nothing. If `park` returned `ok: false`, or `mount_parked` is still not
-   `true`, **retry `park` once** and confirm again. If it still fails, **alert the user
-   loudly** — a push notification if one is available — and name the backstop, e.g.
+3. **Confirm the fold — the `park` reply is not proof either way.** Poll `get_status`
+   about every 30 s for up to ~4 min until `mount_parked` is `true`. The fold takes
+   1–3 min; a shorter poll re-parks a mount that is still folding and raises a false
+   alarm. Read `mount_parked` (the device's own `mount.close`), never `tracking` — that
+   is Alpaca's view and disagrees with the device on this hardware; `mount_parked: null`
+   means the native read failed, which confirms nothing. **A confirmed
+   `mount_parked: true` is parked, even if `park` returned `ok: false`.** Only when the
+   fold is still **not** confirmed at the end of the poll, **retry `park` once** and poll
+   again the same way. If it still fails, **alert the user loudly** — a push
+   notification if one is available — and name the backstop, e.g.
    `PARK NOT CONFIRMED — mount may be unfolded. Dawn watchdog parks at 07:40Z as backstop.`
+   If `park` returned `ok: false` but the fold was then confirmed, `get_run_state` may
+   still read `active` (or `unknown` once its stamp goes stale), because `park` clears
+   the run state only on `ok: true`. That is expected: the confirmed fold is what
+   counts, so do not treat that state as a live run.
 4. `log_session_result(...)` for the **in-progress** target so its integration is not
    lost.
 5. **Summarize the night** in a compact block and **notify the user**: targets imaged,
