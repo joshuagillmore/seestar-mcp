@@ -906,9 +906,9 @@ class SeestarController:
         """Go/no-go sky verdict for tonight: weather + moon over the dark window.
 
         Reads the clock only to resolve "tonight" when ``date`` is omitted. A
-        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
-        omitted means tonight (or the current night if already dark) — see
-        :func:`planning_when`. A weather outage degrades to ``go=None``
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. A weather outage degrades to ``go=None``
         (non-fatal); planning still runs.
         """
         from datetime import datetime, timezone
@@ -941,9 +941,9 @@ class SeestarController:
         """Observability of one named DSO tonight (altitude, sweet band, moon).
 
         Reads the clock only to resolve "tonight" when ``date`` is omitted. A
-        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
-        omitted means tonight (or the current night if already dark) — see
-        :func:`planning_when`. Read-only; no device motion.
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. Read-only; no device motion.
         """
         from datetime import datetime, timezone
 
@@ -987,9 +987,9 @@ class SeestarController:
         """Rank tonight's best DSO targets — a scored, reasoned shortlist.
 
         Reads the clock only to resolve "tonight" when ``date`` is omitted. A
-        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
-        omitted means tonight (or the current night if already dark) — see
-        :func:`planning_when`. Returns a compact per-target summary
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. Returns a compact per-target summary
         (id/name/type/score/reasons/window + key observability numbers) rather
         than the full nested record.
 
@@ -1229,9 +1229,9 @@ class SeestarController:
         Reads/computes only — issues NO device motion. Ranks tonight's targets
         via :meth:`plan_targets`, then rotates them through the dark window with
         the pure :func:`plan_night` sequencer (45-min slot cap). Reads the clock
-        only to resolve "tonight" when ``date`` is omitted. A bare
-        ``YYYY-MM-DD`` means the night beginning on that date's evening; omitted
-        means tonight (or the current night if already dark) — see
+        only to resolve "tonight" when ``date`` is omitted. A bare site-local
+        date (``YYYY-MM-DD``) means the night beginning on that date's evening;
+        omitted means tonight (or the current night if already dark) — see
         :func:`planning_when`.
         """
         try:
@@ -2088,9 +2088,9 @@ async def assess_conditions(date: str | None = None) -> dict:
 
     Read-only. Only external call is one HTTPS GET to Open-Meteo; a weather
     outage is non-fatal (``go=null`` — assess the sky manually). ``date`` (ISO
-    UTC) overrides "tonight": a bare ``YYYY-MM-DD`` means the night beginning on
-    that date's evening; omitted means tonight (or the current night if already
-    dark). Every verdict is reason-tagged.
+    UTC instant) overrides "tonight": a bare site-local date (``YYYY-MM-DD``)
+    means the night beginning on that date's evening; omitted means tonight (or
+    the current night if already dark). Every verdict is reason-tagged.
     """
     return await get_controller().assess_conditions(date)
 
@@ -2101,9 +2101,9 @@ async def get_target_observability(target: str, date: str | None = None) -> dict
 
     Read-only, offline (deterministic astropy ephemeris). ``target`` is a
     catalog id or common name (e.g. ``"M27"`` / ``"Dumbbell Nebula"``); ``date``
-    (ISO UTC) overrides "tonight": a bare ``YYYY-MM-DD`` means the night beginning
-    on that date's evening; omitted means tonight (or the current night if
-    already dark).
+    (ISO UTC instant) overrides "tonight": a bare site-local date
+    (``YYYY-MM-DD``) means the night beginning on that date's evening; omitted
+    means tonight (or the current night if already dark).
     """
     return await get_controller().get_target_observability(target, date)
 
@@ -2122,11 +2122,11 @@ async def plan_targets(
     shortlist.
 
     Read-only. Optionally filter by ``types`` and ``min_alt`` and cap the count
-    with ``limit``. ``date`` (ISO UTC) overrides "tonight": a bare ``YYYY-MM-DD``
-    means the night beginning on that date's evening; omitted means tonight (or
-    the current night if already dark). When ``prefer_projects`` (default) the
-    projects/history store boosts targets that still need data and suppresses
-    ones imaged within ``avoid_recent_days``.
+    with ``limit``. ``date`` (ISO UTC instant) overrides "tonight": a bare
+    site-local date (``YYYY-MM-DD``) means the night beginning on that date's
+    evening; omitted means tonight (or the current night if already dark). When
+    ``prefer_projects`` (default) the projects/history store boosts targets that
+    still need data and suppresses ones imaged within ``avoid_recent_days``.
     """
     return await get_controller().plan_targets(
         date, types, min_alt, limit, avoid_recent_days, prefer_projects
@@ -2209,9 +2209,10 @@ async def simulate_night(
     it starts.
 
     Read-only/compute-only: ranks tonight's targets and packs them into the dark
-    window, issuing zero device motion. ``date`` (ISO UTC) overrides "tonight": a
-    bare ``YYYY-MM-DD`` means the night beginning on that date's evening; omitted
-    means tonight (or the current night if already dark).
+    window, issuing zero device motion. ``date`` (ISO UTC instant) overrides
+    "tonight": a bare site-local date (``YYYY-MM-DD``) means the night beginning
+    on that date's evening; omitted means tonight (or the current night if
+    already dark).
     """
     return await get_controller().simulate_night(date, types, limit)
 

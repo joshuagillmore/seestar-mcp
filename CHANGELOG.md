@@ -27,6 +27,35 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   `datetime.now().isoformat()` rejected by astropy); normalized in `_to_time`.
 - GPS parser now matches real firmware 7.75 (`result.location_lon_lat` `[lon, lat]`), so
   plans use the scope's actual location instead of a stale saved site.
+- `qa_session_report` raised `AttributeError` (`no attribute 'target'`) on any server that
+  had not run `goto_target` in the same process, e.g. right after a restart: the
+  per-session state init had become unreachable code inside `_weather_cached`. Restored in
+  `SeestarController.__init__`.
+- Native JSON-RPC error replies (`{"error": "method not found", "code": 103}`, fw 8.46)
+  passed as success, so `park`, `goto_target`, `start_stack`, `stop_view`, `set_filter`,
+  `set_dew_heater`, `run_autofocus`, `plate_solve` and `shutdown` returned `ok: true` on a
+  command the scope rejected, and `park` cleared the run state although the mount never
+  folded. Every command tool (and the native reads `get_view_state` /
+  `get_focuser_position`) now returns `ok: false` with the text and code
+  (`method not found (code 103)`). `get_status` also carries `mount_parked` /
+  `mount_tracking` from the device's native `get_device_state` (`mount.close` /
+  `mount.tracking`), the authoritative park and tracking signals; Alpaca's `tracking`
+  disagrees with the device on this hardware. That adds one native read, so `get_status`
+  makes six device reads per call.
+- `assess_conditions`, `plan_targets`, `get_target_observability` and `simulate_night`
+  planned last night from a morning or afternoon call, and a bare `date` parsed to 00:00Z
+  (the evening before, in the Americas). They now plan the upcoming night (the current one
+  once dark), and a bare site-local `YYYY-MM-DD` means the night beginning that evening.
+  `dark_window` no longer clips the night at the edge of its ±12 h search grid (dawn came
+  back as 08:00Z instead of ≈09:25Z at lat 38.9).
+- The planner computes the dark window once per ranking instead of once per catalog
+  target — about 2× faster than before these fixes (120 targets: 8.1 s → ≈4.0 s on a
+  desktop) — and `plan_targets` / `get_target_observability` now return
+  `dark_window_utc`, the night they actually planned.
+- `plate_solve` returned `ok: true` with the PREVIOUS solve when the scope rejected
+  `start_solve` (`{"error": "fail to operate", "code": 207}`): the start reply was discarded
+  and `get_solve_result` handed back the last solution. Any native error from `start_solve`,
+  including seestar_alp's timeout string, now returns `ok: false`.
 
 ### Changed
 - `SECURITY.md`: corrected the tool count (33 + 5), reworded the `seestar_alp` supply-chain
@@ -58,6 +87,13 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   `deploy/dawn_park_watchdog.sh`) were scanned for the same problem and are clean: Dockerfile,
   YAML, TOML and bash comments all behave as their authors intended, unlike systemd's
   ini-like format.
+  **Operators: smoke-test service startup after deploying this unit.** The hardening takes
+  effect for the first time: the service has never run under these seven directives. With
+  `ProtectSystem=strict` + `ProtectHome=yes`, `uv run` (the unit's `ExecStart`) may be
+  unable to write its cache or `/opt/seestar-mcp/.venv` and fail at startup. This could not
+  be verified without the Jetson. Likely remedies, listed in the unit's header: a
+  `UV_CACHE_DIR` under a writable path, adding that path to `ReadWritePaths`, or
+  `uv run --frozen --no-sync` against an env pre-synced at deploy time.
 
 ## [0.1.0] - 2026-07-05
 

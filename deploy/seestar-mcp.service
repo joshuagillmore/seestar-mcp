@@ -16,6 +16,26 @@
 # (2026-09-22 review: a stray inline `#` on seven directives here silently
 # dropped them — systemd only warns to the log, it doesn't fail the unit — so
 # a one-time verify after any edit to this file is the only way to catch it.)
+#
+# THEN SMOKE-TEST STARTUP — the hardening is NEW, not just re-verified. Before
+# 2026-09-22 those seven directives never applied, so this service has never
+# run under them. With ProtectSystem=strict + ProtectHome=yes, `uv run` (the
+# ExecStart below) may be unable to write its cache (default ~/.cache/uv) or
+# /opt/seestar-mcp/.venv, and fail at startup. Not verifiable without the
+# Jetson, so check on first deploy:
+#   sudo systemctl daemon-reload && sudo systemctl restart seestar-mcp
+#   journalctl -u seestar-mcp -n 50
+# and look for uv failing with "Read-only file system" or "Permission denied"
+# on a cache or .venv path. Likely remedies:
+#   - pre-sync the env at deploy time (`uv sync --frozen`, as the service user)
+#     and launch with `uv run --frozen --no-sync ...`, so uv writes nothing;
+#   - point uv's cache at a writable path, e.g.
+#     `Environment=UV_CACHE_DIR=/opt/seestar-mcp/data/.uv-cache` (already
+#     under ReadWritePaths);
+#   - or add the cache path to ReadWritePaths.
+# A uv-managed Python under the service user's /home is hidden by
+# ProtectHome=yes too; give the account a home outside /home, or build the
+# venv on a system Python.
 
 [Unit]
 Description=seestar-mcp (auditable MCP server for the ZWO Seestar S50)

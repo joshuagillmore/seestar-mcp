@@ -87,16 +87,24 @@ to create state; their shapes are not pinned.
   (`result.mount.close` / `result.mount.tracking`). They are the authoritative
   park and tracking signals: the existing `tracking` is Alpaca's view, which
   disagrees with the device on this hardware (fw 7.75 and 8.46), and is left as
-  it was. `null` means the native read failed — unknown, never `false`.
+  it was. Like the other `get_status` fields, both keys are always present and
+  may be `null` (rule 1): `null` means the native read failed — unknown, never
+  `false`. That read is one more device call: `get_status` now makes six device
+  reads per call (the five Alpaca reads plus one native `get_device_state`), not
+  the single `get_device_state` the 2026-07-31 coordination note promised, and
+  the native read can wait up to `http_timeout_s` (default 30 s) on a busy
+  device; collapsing the five Alpaca reads into that one native read is planned
+  follow-up work.
   **`plan_targets`** and **`get_target_observability`** gained a top-level
   `dark_window_utc`, the same naive two-element pair as
   `assess_conditions.dark_window_utc`, naming the night the result describes.
   And **`date`** on `assess_conditions`, `plan_targets` and
   `get_target_observability` is read differently: a bare `YYYY-MM-DD` is now the
-  night *beginning* that date's evening (it parsed to 00:00Z — the evening
-  before, in the Americas), and an omitted `date` plans the upcoming night, or
-  the current one once dark, where a morning or midday call used to return the
-  night just ended. An explicit ISO instant inside a night is unaffected.
+  site-local date of the night *beginning* that evening (it parsed to 00:00Z —
+  the evening before, in the Americas), and an omitted `date` plans the upcoming
+  night, or the current one once dark, where a morning or midday call used to
+  return the night just ended. Pass the site's calendar date, not the UTC one.
+  An explicit ISO instant inside a night is unaffected.
   *Why:* the 2026-09-22 review found no tool exposed the native mount state, so
   nothing — the run-book skills included — could confirm a park, and a morning
   planning call quietly described last night. `dark_window_utc` lets a caller
