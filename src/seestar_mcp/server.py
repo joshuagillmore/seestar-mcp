@@ -39,7 +39,13 @@ from mcp.server.fastmcp import FastMCP
 
 from .alpaca_client import AlpacaClient, AlpacaError, AlpacaNotImplemented
 from .data_client import DataClient
-from .planning.astro import azalt_at, dark_window, moon_illumination, observability
+from .planning.astro import (
+    azalt_at,
+    dark_window,
+    moon_illumination,
+    observability,
+    planning_when,
+)
 from .planning.autonomous import evaluate_guardrails, plan_night
 from .planning.catalog import find_target, load_catalog
 from .planning.obstructions import (
@@ -891,16 +897,22 @@ class SeestarController:
         """Go/no-go sky verdict for tonight: weather + moon over the dark window.
 
         Reads the clock only to resolve "tonight" when ``date`` is omitted. A
-        weather outage degrades to ``go=None`` (non-fatal); planning still runs.
+        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
+        omitted means tonight (or the current night if already dark) — see
+        :func:`planning_when`. A weather outage degrades to ``go=None``
+        (non-fatal); planning still runs.
         """
         from datetime import datetime, timezone
 
         try:
             self.provenance.log_call(tool="assess_conditions", args={"date": date})
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            # Resolved against the site: `date or now` fed straight to dark_window
+            # planned LAST night from a morning call, and a bare date the night
+            # before it (2026-09-22 review).
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             block = await self._location_block(site)
             site_for_engine = (
                 site
@@ -919,8 +931,10 @@ class SeestarController:
     ) -> dict:
         """Observability of one named DSO tonight (altitude, sweet band, moon).
 
-        Reads the clock only to resolve "tonight" when ``date`` is omitted.
-        Read-only; no device motion.
+        Reads the clock only to resolve "tonight" when ``date`` is omitted. A
+        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
+        omitted means tonight (or the current night if already dark) — see
+        :func:`planning_when`. Read-only; no device motion.
         """
         from datetime import datetime, timezone
 
@@ -929,10 +943,10 @@ class SeestarController:
                 tool="get_target_observability",
                 args={"target": target, "date": date},
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             t = find_target(target)
             if t is None:
                 return {"ok": False, "error": f"unknown target: {target}"}
@@ -956,9 +970,12 @@ class SeestarController:
     ) -> dict:
         """Rank tonight's best DSO targets — a scored, reasoned shortlist.
 
-        Reads the clock only to resolve "tonight" when ``date`` is omitted.
-        Returns a compact per-target summary (id/name/type/score/reasons/window
-        + key observability numbers) rather than the full nested record.
+        Reads the clock only to resolve "tonight" when ``date`` is omitted. A
+        bare ``YYYY-MM-DD`` means the night beginning on that date's evening;
+        omitted means tonight (or the current night if already dark) — see
+        :func:`planning_when`. Returns a compact per-target summary
+        (id/name/type/score/reasons/window + key observability numbers) rather
+        than the full nested record.
 
         When ``prefer_projects`` (default), the persisted projects/history store
         is loaded and threaded into the ranker so active projects still short of
@@ -979,10 +996,12 @@ class SeestarController:
                     "prefer_projects": prefer_projects,
                 },
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            # Idempotent, so simulate_night handing us its resolved instant as
+            # `date` ranks the same night it schedules.
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             # GPS reconcile: if the scope has moved off the saved site, disclose it
             # and run the astronomy against a mask-stripped copy (keep the altitude
             # floor; drop the stale obstruction arcs) so blocked sky is not dropped.
@@ -1185,17 +1204,20 @@ class SeestarController:
         Reads/computes only — issues NO device motion. Ranks tonight's targets
         via :meth:`plan_targets`, then rotates them through the dark window with
         the pure :func:`plan_night` sequencer (45-min slot cap). Reads the clock
-        only to resolve "tonight" when ``date`` is omitted.
+        only to resolve "tonight" when ``date`` is omitted. A bare
+        ``YYYY-MM-DD`` means the night beginning on that date's evening; omitted
+        means tonight (or the current night if already dark) — see
+        :func:`planning_when`.
         """
         try:
             self.provenance.log_call(
                 tool="simulate_night",
                 args={"date": date, "types": types, "limit": limit},
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             plan = await self.plan_targets(date=when, types=types, limit=limit)
             if not plan.get("ok"):
                 return plan
@@ -2041,7 +2063,9 @@ async def assess_conditions(date: str | None = None) -> dict:
 
     Read-only. Only external call is one HTTPS GET to Open-Meteo; a weather
     outage is non-fatal (``go=null`` — assess the sky manually). ``date`` (ISO
-    UTC) overrides "tonight". Every verdict is reason-tagged.
+    UTC) overrides "tonight": a bare ``YYYY-MM-DD`` means the night beginning on
+    that date's evening; omitted means tonight (or the current night if already
+    dark). Every verdict is reason-tagged.
     """
     return await get_controller().assess_conditions(date)
 
@@ -2052,7 +2076,9 @@ async def get_target_observability(target: str, date: str | None = None) -> dict
 
     Read-only, offline (deterministic astropy ephemeris). ``target`` is a
     catalog id or common name (e.g. ``"M27"`` / ``"Dumbbell Nebula"``); ``date``
-    (ISO UTC) overrides "tonight".
+    (ISO UTC) overrides "tonight": a bare ``YYYY-MM-DD`` means the night beginning
+    on that date's evening; omitted means tonight (or the current night if
+    already dark).
     """
     return await get_controller().get_target_observability(target, date)
 
@@ -2071,9 +2097,11 @@ async def plan_targets(
     shortlist.
 
     Read-only. Optionally filter by ``types`` and ``min_alt`` and cap the count
-    with ``limit``. ``date`` (ISO UTC) overrides "tonight". When
-    ``prefer_projects`` (default) the projects/history store boosts targets that
-    still need data and suppresses ones imaged within ``avoid_recent_days``.
+    with ``limit``. ``date`` (ISO UTC) overrides "tonight": a bare ``YYYY-MM-DD``
+    means the night beginning on that date's evening; omitted means tonight (or
+    the current night if already dark). When ``prefer_projects`` (default) the
+    projects/history store boosts targets that still need data and suppresses
+    ones imaged within ``avoid_recent_days``.
     """
     return await get_controller().plan_targets(
         date, types, min_alt, limit, avoid_recent_days, prefer_projects
@@ -2156,7 +2184,9 @@ async def simulate_night(
     it starts.
 
     Read-only/compute-only: ranks tonight's targets and packs them into the dark
-    window, issuing zero device motion. ``date`` (ISO UTC) overrides "tonight".
+    window, issuing zero device motion. ``date`` (ISO UTC) overrides "tonight": a
+    bare ``YYYY-MM-DD`` means the night beginning on that date's evening; omitted
+    means tonight (or the current night if already dark).
     """
     return await get_controller().simulate_night(date, types, limit)
 

@@ -650,3 +650,107 @@ def test_guardrails_read_battery_from_device_state_without_a_second_call(
         f"exactly one device call expected; got {calls}"
     )
     assert len(weather_calls) == 1  # the stub, not the network, answered
+
+
+# --- date semantics: a bare date is THAT evening's night (2026-09-22 review) ---
+# `date or now` went straight into dark_window, whose nearest-night semantics
+# plan LAST night from a morning call, and "2026-09-22" parsed to 00:00Z (20:00
+# EDT on the 21st). The tools now resolve the instant via planning_when.
+
+DC_LAT, DC_LON = 38.9, -77.0
+SEP22_EVENING = ("2026-09-23T00:35", "2026-09-23T09:25")
+
+
+def _near(actual_iso: str, expected_iso: str, tol_min: float = 5.0) -> bool:
+    from datetime import datetime
+
+    a = datetime.fromisoformat(actual_iso.replace("Z", "+00:00")).replace(tzinfo=None)
+    return abs((a - datetime.fromisoformat(expected_iso)).total_seconds()) <= tol_min * 60
+
+
+def _is_sep22_evening(window) -> bool:
+    return _near(window[0], SEP22_EVENING[0]) and _near(window[1], SEP22_EVENING[1])
+
+
+def _echo_weather(monkeypatch, captured: dict | None = None):
+    """Real astronomy; the weather stub echoes the window it was asked about."""
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        if captured is not None:
+            captured["window"] = window
+        a = _canned_conditions()
+        a.dark_window_utc = window
+        return a
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
+
+
+def test_assess_conditions_bare_date_is_that_evenings_night(tmp_path, monkeypatch):
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    monkeypatch.setattr(c, "_current_gps", AsyncMock(return_value=None))
+    _echo_weather(monkeypatch)
+
+    r = asyncio.run(c.assess_conditions(date="2026-09-22"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]
+
+
+def test_plan_targets_bare_date_ranks_that_evenings_night(tmp_path, monkeypatch):
+    from seestar_mcp.planning.astro import dark_window
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    monkeypatch.setattr(c, "_current_gps", AsyncMock(return_value=None))
+    monkeypatch.setattr(server_mod, "load_catalog", lambda: [])
+    weather: dict = {}
+    _echo_weather(monkeypatch, weather)
+    ranked: dict = {}
+
+    def _fake_rank(*a, **k):
+        ranked["when"] = a[1]
+        ranked["now_utc"] = k["now_utc"]
+        return []
+
+    monkeypatch.setattr(server_mod, "rank_targets", _fake_rank)
+
+    r = asyncio.run(c.plan_targets(date="2026-09-22"))
+    assert r["ok"] is True
+    # Weather and ranking agree on the night beginning the evening of Sep 22.
+    assert _is_sep22_evening(weather["window"]), weather["window"]
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    assert _is_sep22_evening(dark_window(site, ranked["when"])), ranked["when"]
+    assert ranked["now_utc"] == ranked["when"]
+
+
+def test_get_target_observability_bare_date_is_that_evenings_night(tmp_path):
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    r = asyncio.run(c.get_target_observability("M31", date="2026-09-22"))
+    assert r["ok"] is True
+    transit = r["observability"]["transit_utc"]
+    assert SEP22_EVENING[0] <= transit[:16] <= SEP22_EVENING[1], transit
+
+
+def test_simulate_night_bare_date_schedules_that_evenings_night(tmp_path, monkeypatch):
+    from seestar_mcp.planning.astro import dark_window
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    planned: dict = {}
+
+    async def _fake_plan_targets(date=None, types=None, limit=None):
+        planned["date"] = date
+        return {"ok": True, "conditions": None, "location": None, "targets": []}
+
+    monkeypatch.setattr(c, "plan_targets", _fake_plan_targets)
+
+    r = asyncio.run(c.simulate_night(date="2026-09-22"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]
+    # plan_targets was handed the resolved instant, so it ranks the SAME night.
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    assert dark_window(site, planned["date"]) == tuple(r["dark_window_utc"])
