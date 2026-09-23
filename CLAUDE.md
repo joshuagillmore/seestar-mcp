@@ -16,7 +16,7 @@ destructive. Runs on a Jetson, driven from the Claude phone app via Remote Contr
 There is **no bare `python`** on the dev machine (Windows Store shim). Always:
 
 ```bash
-uv run pytest            # full suite (300 tests, all green)
+uv run pytest            # full suite (398 tests, all green)
 uv run ruff check src tests
 uv run python -m seestar_mcp.server   # launch the MCP server (stdio)
 uv run python -c "..."   # one-off checks
