@@ -374,13 +374,58 @@ async def test_download_subs_absolute_name_rejected_no_write(tmp_path):
     assert record["args"]["name"] == str(outside)
 
 
-async def test_download_subs_windows_absolute_name_rejected(tmp_path):
-    """A Windows/POSIX absolute drive/root name is rejected by the guard."""
-    client, _, _ = _make_client()
-    for bad in ("C:\\Windows\\evil.fits", "/etc/evil.fits"):
-        sub = SubInfo(name=bad, path="M31_sub/real.fits")
-        with pytest.raises(ValueError):
-            await client.download_subs([sub], dest=tmp_path)
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "C:\\Windows\\evil.fits",  # drive-absolute
+        "C:evil.fits",  # drive-relative: lands inside dest on Windows, still refused
+        "..\\evil.fits",  # backslash traversal
+        "M31_sub\\evil.fits",  # backslash subdirectory
+        "/etc/evil.fits",  # POSIX absolute
+    ],
+)
+async def test_download_subs_windows_absolute_name_rejected(tmp_path, bad):
+    """A drive-letter, backslash or absolute name is refused by the guard ITSELF.
+
+    This used to pass on Linux CI for the wrong reason (2026-09-22 review): on
+    POSIX ``C:\\Windows\\evil.fits`` is one legal filename, so the guard let it
+    through, HTTP failed, and smbprotocol's own ``ValueError("Failed to
+    connect…")`` satisfied a bare ``pytest.raises(ValueError)``. Now the message
+    and the audit record must be the guard's, and any fetch fails the test.
+    """
+    prov = ProvenanceLog(tmp_path / "prov.jsonl")
+    client, _, _ = _make_client(provenance=prov)
+    client._fetch = AsyncMock(
+        side_effect=AssertionError("guard must fire before any fetch")
+    )
+    sub = SubInfo(name=bad, path="M31_sub/real.fits")
+
+    with pytest.raises(ValueError, match="refusing to write outside data dir"):
+        await client.download_subs([sub], dest=tmp_path)
+
+    lines = (tmp_path / "prov.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    record = json.loads(lines[-1])
+    assert record["tool"] == "data.download.rejected"
+    assert record["args"]["name"] == bad
+
+
+@pytest.mark.parametrize(
+    ("name", "foreign"),
+    [
+        ("C:\\Windows\\evil.fits", True),
+        ("C:evil.fits", True),
+        ("c:/evil.fits", True),
+        ("..\\evil.fits", True),
+        ("\\\\host\\share\\evil.fits", True),
+        ("Light_M 31_10.0s_IRCUT_20240101-223100.fit", False),
+        ("DSO_Stacked_1_M31_10s_20260704_2231.fit", False),
+    ],
+)
+def test_windows_path_syntax_is_detected_on_every_platform(name, foreign):
+    """Pure string check, so it answers the same on Windows and Linux."""
+    from seestar_mcp.data_client import _has_windows_path_syntax
+
+    assert _has_windows_path_syntax(name) is foreign
 
 
 # --- filesystem / UNC (SMB-mount) sub access ------------------------------

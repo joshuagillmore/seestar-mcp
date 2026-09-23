@@ -601,7 +601,9 @@ def test_suggest_horizon_mask_no_site(tmp_path):
     assert "site" in r["error"].lower()
 
 
-def test_guardrails_read_battery_from_device_state_without_a_second_call(tmp_path):
+def test_guardrails_read_battery_from_device_state_without_a_second_call(
+    tmp_path, monkeypatch
+):
     """Battery comes from the get_device_state we already made — no pi_get_info.
 
     HARDWARE-VERIFIED (fw 7.75): battery lives at
@@ -630,9 +632,21 @@ def test_guardrails_read_battery_from_device_state_without_a_second_call(tmp_pat
         raise AssertionError(f"unexpected extra device call: {method}")
 
     c.alpaca.method_sync = _method_sync
+
+    # Stubbed explicitly (2026-09-22 review): unstubbed, this test reached the
+    # live Open-Meteo API, and would have spent meteoblue credits had
+    # SEESTAR_METEOBLUE_API_KEY been exported.
+    weather_calls = []
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        weather_calls.append(window)
+        return _canned_conditions()
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
     out = asyncio.run(c.check_night_guardrails(session_start_utc="2026-08-02T02:00:00Z"))
 
     assert out["ok"] is True
     assert calls == ["get_device_state"], (
         f"exactly one device call expected; got {calls}"
     )
+    assert len(weather_calls) == 1  # the stub, not the network, answered
