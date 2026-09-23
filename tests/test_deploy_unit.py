@@ -12,6 +12,16 @@ the bug unnoticed.
 
 Uses `Path(__file__)`, not the cwd: `tests/conftest.py` chdirs every test into
 its own tmp_path.
+
+Fix round 1 (2026-09-22, review of commit 5c5e6ab): that fix accidentally
+converted the whole unit file to CRLF. The unit deploys to a Linux Jetson,
+where `core.autocrlf` doesn't apply; systemd < v246 (JetPack 5.x ships 245)
+does not strip a trailing `\r` from a directive's value, so every directive
+would silently carry one — the exact same corruption class this file exists
+to catch, just spread across the whole unit instead of seven lines. The
+original inline-comment test couldn't see it because `Path.read_text()` does
+universal-newline translation, which absorbs `\r` before `splitlines()` runs.
+`test_unit_file_is_lf_only` reads raw bytes to close that gap.
 """
 
 from __future__ import annotations
@@ -56,6 +66,22 @@ def _parse_directives(text: str) -> dict[str, str]:
 
 def test_unit_file_exists() -> None:
     assert UNIT_PATH.is_file(), f"expected unit file at {UNIT_PATH}"
+
+
+def test_unit_file_is_lf_only() -> None:
+    """Raw-byte check: `\\r` anywhere means CRLF snuck in.
+
+    Deliberately reads bytes, not `.read_text()` — Python's universal-newline
+    translation would absorb a `\\r` before it ever reached a string-based
+    assertion, exactly what let commit 5c5e6ab's CRLF conversion slip past the
+    other tests in this file.
+    """
+    raw = UNIT_PATH.read_bytes()
+    assert b"\r" not in raw, (
+        "deploy/seestar-mcp.service contains CRLF line endings; the unit "
+        "deploys to a Linux Jetson where a trailing \\r on a directive value "
+        "is not stripped by systemd < v246 and corrupts every directive"
+    )
 
 
 def test_no_directive_value_contains_inline_comment() -> None:
