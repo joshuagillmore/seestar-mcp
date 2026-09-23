@@ -256,7 +256,7 @@ their descriptions; Skills gate them behind explicit user confirmation.
 | Tool | Description |
 |---|---|
 | `connect_telescope` | Connect to the Seestar via seestar_alp. No motion; safe anytime. |
-| `get_status` | Read connection, RA/Dec pointing, and tracking/slewing state. Read-only. |
+| `get_status` | Read connection, RA/Dec pointing, and tracking/slewing state. Read-only. `tracking` is Alpaca's view and disagrees with the device; `mount_parked` / `mount_tracking` are the authoritative native fields from one `get_device_state` call (`null` if that read fails). |
 | `get_view_state` | Read the device's live view/stacking telemetry. Read-only. |
 | `get_run_state` | Read the persisted session record: `state` is tri-valued (`active` / `idle` / `unknown`, where `unknown` means a run was recorded but its stamp went stale). Survives an MCP restart, so a new session can tell whether a run is still in flight. Read-only. |
 | `goto_target` | Slew to a target and open a new session (commands MOTION). |

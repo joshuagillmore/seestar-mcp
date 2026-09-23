@@ -13,6 +13,8 @@ import asyncio
 import inspect
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import seestar_mcp.server as server_mod
 from seestar_mcp.alpaca_client import AlpacaError
 from seestar_mcp.server import SeestarController, mcp
@@ -633,3 +635,297 @@ def test_connect_telescope_still_succeeds_when_it_connects(tmp_path):
     )
     out = asyncio.run(c.connect_telescope())
     assert out["ok"] is True and out["connected"] is True
+
+
+# --- native JSON-RPC error dicts must fail (2026-09-22 review, task 5) --------
+# The firmware reports a rejected command as a JSON-RPC dict,
+# {"error": "method not found", "code": 103} (probed on fw 8.46, see
+# data_client.py). _native_error only recognised an "Error..." *string*, so that
+# dict passed as success: park/goto/stack/filter/heater/shutdown all returned
+# ok:true on a command the scope never ran, and park() then cleared the run
+# state although the mount never folded.
+
+NATIVE_ERROR_REPLY = {"error": "method not found", "code": 103}
+NATIVE_OK_REPLY = {"jsonrpc": "2.0", "method": "x", "result": 0, "code": 0}
+
+#: Every controller method that routes a native result through _native_fail.
+_NATIVE_GUARDED = {
+    "get_view_state": lambda c: c.get_view_state(),
+    "goto_target": lambda c: c.goto_target("M31", 10.68, 41.27, session_id="t5"),
+    "start_stack": lambda c: c.start_stack(),
+    "stop_view": lambda c: c.stop_view("Stack"),
+    "run_autofocus": lambda c: c.run_autofocus(),
+    "get_focuser_position": lambda c: c.get_focuser_position(),
+    "plate_solve": lambda c: c.plate_solve(),
+    "set_filter": lambda c: c.set_filter(2),
+    "set_dew_heater": lambda c: c.set_dew_heater(True),
+    "park": lambda c: c.park(),
+    "shutdown": lambda c: c.shutdown(),
+}
+
+
+def _native_ctl(tmp_path, reply):
+    from seestar_mcp.config import Settings
+
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = reply
+    return SeestarController(
+        settings=Settings(
+            _env_file=None, data_dir=tmp_path, manifest_dir=tmp_path / "m"
+        ),
+        provenance=MagicMock(),
+        alpaca=alpaca,
+        data=AsyncMock(),
+        tier1=MagicMock(),  # set_focus_baseline is sync
+    )
+
+
+def test_native_guarded_list_covers_every_native_fail_call_site():
+    # "Every" must stay true: a new controller method that guards a native
+    # result has to join the parametrization below, not silently skip it.
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SeestarController)))
+    callers = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_native_fail"
+            for n in ast.walk(fn)
+        )
+    }
+    assert callers == set(_NATIVE_GUARDED)
+
+
+@pytest.mark.parametrize("name", sorted(_NATIVE_GUARDED))
+async def test_native_error_dict_maps_to_ok_false(tmp_path, name):
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_ERROR_REPLY))
+    result = await _NATIVE_GUARDED[name](ctrl)
+    assert result["ok"] is False, f"{name} reported success on a rejected command"
+    assert "method not found" in result["error"]
+    assert "103" in result["error"], "the firmware's code must reach the caller"
+
+
+@pytest.mark.parametrize("name", sorted(_NATIVE_GUARDED))
+async def test_native_success_with_code_zero_stays_ok_true(tmp_path, name):
+    # No over-trigger: a normal reply carries "code": 0 and no "error" key.
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_OK_REPLY))
+    result = await _NATIVE_GUARDED[name](ctrl)
+    assert result["ok"] is True, f"{name} failed a normal success reply: {result}"
+
+
+def test_native_error_formats_text_and_code():
+    from seestar_mcp.server import _native_error
+
+    assert _native_error(NATIVE_ERROR_REPLY) == "method not found (code 103)"
+    assert _native_error({"error": "busy"}) == "busy"  # no code -> text only
+    # Standard JSON-RPC 2.0 error object, in case a bridge normalises to it.
+    assert _native_error(
+        {"error": {"code": -32601, "message": "Method not found"}}
+    ) == "Method not found (code -32601)"
+    # Falsy "error" values and plain success replies are not errors.
+    assert _native_error({"error": None, "result": 0, "code": 0}) is None
+    assert _native_error({"error": "", "result": 0}) is None
+    assert _native_error(NATIVE_OK_REPLY) is None
+    # Existing shapes are unchanged.
+    assert _native_error("Error: park refused") == "Error: park refused"
+    assert _native_error({"result": "Error: x"}) == "Error: x"
+    assert _native_error({"result": {"step": 1}}) is None
+
+
+async def test_park_rejected_by_device_keeps_the_run_state(tmp_path):
+    from seestar_mcp.run_state import RunState, read_run_state, write_run_state
+
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_ERROR_REPLY))
+    path = ctrl._run_state_path()
+    write_run_state(
+        RunState(session_start_utc="2026-09-22T02:00:00+00:00", target="M31"), path
+    )
+    result = await ctrl.park()
+    assert result["ok"] is False
+    assert path.exists(), "a rejected park cleared the run state; the mount never folded"
+    assert read_run_state(path)["state"] == "active"
+
+
+async def test_park_success_clears_the_run_state(tmp_path):
+    from seestar_mcp.run_state import RunState, read_run_state, write_run_state
+
+    ctrl = _native_ctl(
+        tmp_path, {"jsonrpc": "2.0", "method": "scope_park", "result": 0, "code": 0}
+    )
+    path = ctrl._run_state_path()
+    write_run_state(
+        RunState(session_start_utc="2026-09-22T02:00:00+00:00", target="M31"), path
+    )
+    result = await ctrl.park()
+    assert result["ok"] is True
+    assert not path.exists()
+    assert read_run_state(path)["state"] == "idle"
+
+
+# Pin the native method each motion tool sends. These are FIRMWARE-DEPENDENT
+# names; a silent rename would make the tool a no-op on hardware.
+@pytest.mark.parametrize(
+    ("invoke", "expected_args"),
+    [
+        (lambda c: c.park(), ("scope_park",)),
+        (lambda c: c.shutdown(), ("pi_shutdown",)),
+        (lambda c: c.set_filter(2), ("set_wheel_position", [2])),
+        (lambda c: c.start_stack(), ("iscope_start_stack",)),
+        (lambda c: c.stop_view("Stack"), ("iscope_stop_view", ["Stack"])),
+        (
+            lambda c: c.stop_view("ContinuousExposure"),
+            ("iscope_stop_view", ["ContinuousExposure"]),
+        ),
+    ],
+    ids=["park", "shutdown", "set_filter", "start_stack", "stop_view", "stop_view_ce"],
+)
+async def test_motion_tools_send_the_pinned_native_method(
+    tmp_path, invoke, expected_args
+):
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_OK_REPLY))
+    await invoke(ctrl)
+    assert ctrl.alpaca.method_sync.await_count == 1
+    assert ctrl.alpaca.method_sync.await_args.args == expected_args
+    assert ctrl.alpaca.method_sync.await_args.kwargs == {}
+
+
+async def test_run_autofocus_sends_start_auto_focus_then_reads_the_focuser(tmp_path):
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_OK_REPLY))
+    await ctrl.run_autofocus()
+    calls = ctrl.alpaca.method_sync.await_args_list
+    assert calls[0].args == ("start_auto_focus",)
+    assert calls[1].args == ("get_focuser_position", {"ret_obj": True})
+
+
+# --- get_status carries the authoritative native mount state -----------------
+# Alpaca /tracking and /atpark disagree with the device on fw 7.75 and 8.46;
+# get_device_state's mount.close (True = arm folded) is the authoritative park
+# signal (CLAUDE.md). No tool exposed it, so the skills could not confirm a park.
+
+#: A fw 8.46-shaped get_device_state reply: the JSON-RPC envelope, the validated
+#: paths (device.is_verified, location_lon_lat, pi_status.battery_capacity) and
+#: the mount block with close/tracking. Other device keys trimmed.
+DEVICE_STATE_846 = {
+    "jsonrpc": "2.0",
+    "Timestamp": "412.118804211",
+    "method": "get_device_state",
+    "result": {
+        "device": {"name": "Seestar S50", "is_verified": True},
+        "setting": {"lang": "en"},
+        "location_lon_lat": [-75.7, 45.4],
+        "pi_status": {"battery_capacity": 87},
+        "mount": {"move_type": "none", "close": True, "tracking": False},
+    },
+    "code": 0,
+    "id": 90311,
+}
+
+
+def test_parse_mount_state_reads_the_fw846_nested_shape():
+    from seestar_mcp.server import _parse_mount_state
+
+    assert _parse_mount_state(DEVICE_STATE_846) == (True, False)
+    unfolded = {"result": {"mount": {"close": False, "tracking": True}}}
+    assert _parse_mount_state(unfolded) == (False, True)
+    # Flat mount dict for simple mocks.
+    assert _parse_mount_state({"mount": {"close": True, "tracking": True}}) == (
+        True,
+        True,
+    )
+    # One field missing -> only that field is unknown.
+    assert _parse_mount_state({"result": {"mount": {"close": True}}}) == (True, None)
+
+
+def test_parse_mount_state_is_unknown_on_junk():
+    from seestar_mcp.server import _parse_mount_state
+
+    for junk in (
+        None,
+        {},
+        "Error: Exceeded allotted wait time for result",
+        [True, False],
+        MagicMock(),
+        NATIVE_ERROR_REPLY,
+        {"result": {}},
+        {"result": {"mount": None}},
+        {"result": {"mount": "folded"}},
+        {"result": "Error: x"},
+        {"focus_pos": 1500, "tracking": True},  # no mount block at all
+    ):
+        assert _parse_mount_state(junk) == (None, None), junk
+    # Non-bool values are not guessed at: a misread park signal is worse than none.
+    odd = {"result": {"mount": {"close": 1, "tracking": "no"}}}
+    assert _parse_mount_state(odd) == (None, None)
+
+
+def _status_ctl(tmp_path, device_reply=None, device_exc=None):
+    from seestar_mcp.config import Settings
+
+    alpaca = AsyncMock()
+    alpaca.get_connected.return_value = True
+    alpaca.get_ra.return_value = 1.7
+    alpaca.get_dec.return_value = 51.5
+    alpaca.get_tracking.return_value = True  # Alpaca's (disagreeing) view
+    alpaca.is_slewing.return_value = False
+    if device_exc is not None:
+        alpaca.method_sync.side_effect = device_exc
+    else:
+        alpaca.method_sync.return_value = device_reply
+    return SeestarController(
+        settings=Settings(_env_file=None, data_dir=tmp_path),
+        provenance=MagicMock(),
+        alpaca=alpaca,
+        data=AsyncMock(),
+        tier1=AsyncMock(),
+    )
+
+
+_ALPACA_STATUS = {
+    "ok": True,
+    "connected": True,
+    "rightascension": 1.7,
+    "declination": 51.5,
+    "tracking": True,
+    "slewing": False,
+}
+
+
+async def test_get_status_carries_the_native_mount_state(tmp_path):
+    ctrl = _status_ctl(tmp_path, device_reply=DEVICE_STATE_846)
+    out = await ctrl.get_status()
+    # Existing keys and values unchanged; the native fields are additive.
+    assert {k: out[k] for k in _ALPACA_STATUS} == _ALPACA_STATUS
+    assert out["mount_parked"] is True
+    assert out["mount_tracking"] is False
+    assert ctrl.alpaca.method_sync.await_count == 1
+    assert ctrl.alpaca.method_sync.await_args.args == ("get_device_state",)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"device_reply": dict(NATIVE_ERROR_REPLY)},
+        {"device_reply": "Error: Exceeded allotted wait time for result"},
+        {"device_reply": None},
+        {"device_exc": AlpacaError(1025, "ValueNotSet", "action")},
+        {"device_exc": RuntimeError("bridge fell over")},
+    ],
+    ids=["error-dict", "error-string", "none", "alpaca-error", "any-exception"],
+)
+async def test_get_status_native_read_failure_is_unknown_not_fatal(tmp_path, kwargs):
+    ctrl = _status_ctl(tmp_path, **kwargs)
+    out = await ctrl.get_status()
+    assert {k: out[k] for k in _ALPACA_STATUS} == _ALPACA_STATUS
+    assert out["mount_parked"] is None
+    assert out["mount_tracking"] is None
+
+
+async def test_get_status_description_names_the_authoritative_fields():
+    tools = {t.name: t for t in await mcp.list_tools()}
+    desc = tools["get_status"].description or ""
+    assert "mount_parked" in desc and "mount_tracking" in desc
+    assert "get_device_state" in desc
+    assert "disagree" in desc.lower(), "must warn that Alpaca tracking is unreliable"

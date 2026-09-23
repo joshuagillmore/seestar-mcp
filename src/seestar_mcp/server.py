@@ -228,8 +228,14 @@ class SeestarController:
     async def get_status(self) -> dict:
         """Read connection + pointing + tracking/slewing state.
 
-        Each field is read independently; a ``NotImplemented`` GET (expected for
-        a few standard ASCOM properties the Seestar lacks) resolves to ``None``.
+        Each Alpaca field is read independently; a ``NotImplemented`` GET
+        (expected for a few standard ASCOM properties the Seestar lacks)
+        resolves to ``None``.
+
+        ``tracking`` is ALPACA's view, which disagrees with the device on fw 7.75
+        and 8.46. ``mount_parked`` / ``mount_tracking`` come from one native
+        ``get_device_state`` call (``result.mount.close`` / ``.tracking``) and
+        are the authoritative fields; see :func:`_parse_mount_state`.
         """
         try:
             self.provenance.log_call(tool="get_status", args={})
@@ -240,6 +246,18 @@ class SeestarController:
                 "tracking": await self._maybe(self.alpaca.get_tracking()),
                 "slewing": await self._maybe(self.alpaca.is_slewing()),
             }
+            # Task 5 (2026-09-22 review remediation): no tool exposed the native
+            # mount state, so the skills could not confirm a park — Alpaca's
+            # /atpark and /tracking disagree with the device on this hardware.
+            # Best-effort and additive: any failure is unknown (None), never a
+            # failed get_status.
+            try:
+                dev = await self.alpaca.method_sync("get_device_state")
+                parked, mount_tracking = _parse_mount_state(dev)
+            except Exception:  # noqa: BLE001 - advisory read, never fatal
+                parked, mount_tracking = (None, None)
+            status["mount_parked"] = parked
+            status["mount_tracking"] = mount_tracking
             return {"ok": True, **status}
         except AlpacaError as exc:
             return _err(exc)
@@ -1522,6 +1540,16 @@ def _native_error(value: Any) -> str | None:
     Alpaca ``ErrorNumber`` is 0. Detect that so the controller surfaces it as
     ``ok:false`` instead of a false ``ok:true``. Handles both a bare string and a
     dict whose ``"result"`` is such a string.
+
+    HARDWARE-OBSERVED (fw 8.46, 2026-08-03): the firmware itself rejects a
+    command with a JSON-RPC dict, ``{"error": "method not found", "code": 103}``
+    (the probe recorded in ``data_client.py``). Until 2026-09-22 that shape
+    passed as success, so park/goto/stack/filter/heater/shutdown returned
+    ``ok:true`` on a command the scope never ran — and ``park`` then cleared the
+    run state although the mount never folded. Any dict with a truthy
+    ``"error"`` is now an error, reported as ``"<text> (code <n>)"``. A normal
+    reply carries ``"code": 0`` and no ``"error"``, so it is not affected. A
+    standard JSON-RPC 2.0 error object (``{"message", "code"}``) is read too.
     """
     if isinstance(value, str) and value.strip().lower().startswith("error"):
         return value
@@ -1529,6 +1557,15 @@ def _native_error(value: Any) -> str | None:
         result = value.get("result")
         if isinstance(result, str) and result.strip().lower().startswith("error"):
             return result
+        err = value.get("error")
+        if err:
+            code = value.get("code")
+            if isinstance(err, dict):
+                code = err.get("code", code)
+                text = str(err.get("message") or err)
+            else:
+                text = str(err)
+            return f"{text} (code {code})" if code is not None else text
     return None
 
 
@@ -1644,6 +1681,35 @@ def _parse_device_health(dev: Any) -> tuple[bool, bool]:
     return (True, verified)
 
 
+def _parse_mount_state(dev: Any) -> tuple[bool | None, bool | None]:
+    """Extract ``(parked, tracking)`` from a ``get_device_state`` reply.
+
+    HARDWARE-VALIDATED (fw 7.75 and 8.46): ``result.mount.close`` is ``True``
+    when the arm is folded — the authoritative park signal — and
+    ``result.mount.tracking`` is the device's own tracking flag. Alpaca's
+    ``/atpark`` and ``/tracking`` disagree with both on this hardware (see
+    CLAUDE.md), which is why ``get_status`` carries these beside Alpaca's
+    ``tracking`` (2026-09-22 review remediation, task 5).
+
+    Falls back to a flat ``mount`` dict for simple mocks. Each value is a real
+    ``bool`` or ``None``: an unexpected shape, a missing field or a non-bool
+    value is UNKNOWN, never guessed — a misread park signal is worse than none.
+    """
+    if not isinstance(dev, dict):
+        return (None, None)
+    result = dev.get("result")
+    mount = result.get("mount") if isinstance(result, dict) else None
+    if not isinstance(mount, dict):
+        mount = dev.get("mount")
+    if not isinstance(mount, dict):
+        return (None, None)
+    close, tracking = mount.get("close"), mount.get("tracking")
+    return (
+        close if isinstance(close, bool) else None,
+        tracking if isinstance(tracking, bool) else None,
+    )
+
+
 def _parse_battery(info: Any) -> float | None:
     """Extract battery percent from a ``get_device_state`` or ``pi_get_info`` reply.
 
@@ -1751,7 +1817,14 @@ async def connect_telescope() -> dict:
 
 @mcp.tool()
 async def get_status() -> dict:
-    """Read connection, RA/Dec pointing, and tracking/slewing state. Read-only."""
+    """Read connection, RA/Dec pointing, and tracking/slewing state. Read-only.
+
+    ``tracking`` is Alpaca's view and is known to disagree with the device on
+    this hardware. ``mount_parked`` (arm folded) and ``mount_tracking`` are the
+    authoritative native fields, read by one native ``get_device_state`` call;
+    each is ``true``/``false``, or ``null`` when that read fails. Confirm a park
+    with ``mount_parked``, not ``tracking``.
+    """
     return await get_controller().get_status()
 
 
