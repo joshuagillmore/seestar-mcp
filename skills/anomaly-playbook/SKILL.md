@@ -16,6 +16,15 @@ it, identify the likely cause, take the safe action, and escalate to the user on
 judgment call is needed. Always log what you observed and what you did (the provenance
 layer captures commands; add a one-line human-readable note).
 
+## Precedence: an authorised autonomous night
+During a run the user started through **`autonomous-night`** (its dry run plus explicit
+"go" pre-authorises parking at dawn or on any hard stop), a `check_night_guardrails`
+hard stop or a confirmed weather no-go **parks without asking**: go straight to
+`autonomous-night` Phase C, then notify. Nobody may be awake to answer, and rain does not
+wait. The "always ask first" rules below apply to **attended** sessions only. Everything
+else here still holds — diagnose first, one retry, and ask before anything the dry run
+did not show (a new field, the dew heater, a mask edit).
+
 ## Triage order
 When multiple symptoms appear at once, diagnose in this order, because earlier items
 cause later ones: (1) connection, (2) tracking/mount, (3) plate-solve/pointing,
@@ -30,7 +39,10 @@ silently stopped.
   are likely; offer to pause and resume, or keep accumulating (the firmware rejects bad
   frames anyway). User decides whether to wait it out.
 - If star count is fine but count is flat → tracking or session issue. Re-check tracking
-  state; if tracking stopped, re-issue goto + plate_solve to recover. Surface to user.
+  with `get_status.mount_tracking` (the device's native flag) — not `get_status.tracking`,
+  which is Alpaca's view and unreliable on this hardware. If `mount_tracking` is `false`,
+  re-issue goto + plate_solve to recover; `null` means the native read failed and proves
+  nothing either way. Surface to user.
 
 ## Symptom: rejection rate spiking
 Likely causes: field rotation (alt-az); dew on the optics; wind; tracking error.
@@ -72,8 +84,9 @@ False, or cloud cover rising in the forecast, while a session is live.
 - On a **hard no-go** — precipitation, or a sustained no-go with no clearing in the dark
   window — recommend winding down: stop the stack, run the Phase 5 wind-down (including
   logging the session), and `park` the mount to get the optics horizontal.
-- Pausing, winding down, and parking are all state-changing — **always ask first**; never
-  auto-abort a session on weather.
+- Pausing, winding down, and parking are all state-changing — in an **attended** session,
+  **always ask first**; never auto-abort on weather. In an authorised autonomous night the
+  precedence rule at the top applies instead: park without asking.
 
 ## Symptom: goto seems stuck (but may be a normal alignment)
 Likely cause: the normal `Initialise`/`3PPA` alignment the firmware runs on a goto, which
@@ -119,7 +132,8 @@ Likely causes: too few stars (clouds/transparency); the target field is sparse; 
 - **First: focus is normally established during acquisition** (the alignment runs its own
   autofocus), so a failing `run_autofocus` is not automatically a problem — see
   `run-session` Phase 2. On some firmware the underlying device method is unavailable and
-  the call simply errors; that is not a focuser fault and must not block the session.
+  the call returns `ok: false` with `"method not found (code 103)"`; that is not a
+  focuser fault and must not block the session.
 - Retry `run_autofocus` once. If it fails again and star count is low → it's sky/field,
   not the focuser; advise waiting or slewing to a richer nearby field to focus, then
   returning. Surface to the user before improvising a slew.
@@ -156,9 +170,10 @@ seestar_alp restarted; firmware auth handshake broke after an update.
 ## When to act automatically vs ask
 - **Act automatically (single retry, then report):** plate-solve retry, autofocus retry,
   re-issuing goto to recover tracking, logging field rotation.
-- **Always ask first:** any new/unplanned slew to a different field, enabling the dew
-  heater (dark-frame impact), pausing/ending the session, parking or shutting down,
-  waiting out clouds vs continuing.
+- **Always ask first** (except a hard stop or weather no-go in an authorised autonomous
+  night — see the precedence rule at the top): any new/unplanned slew to a different
+  field, enabling the dew heater (dark-frame impact), pausing/ending the session, parking
+  or shutting down, waiting out clouds vs continuing.
 
 ## Hard rules
 - Diagnose root cause before acting; don't refocus a cloud problem or re-point a focus

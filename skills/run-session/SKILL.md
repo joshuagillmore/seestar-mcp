@@ -14,7 +14,11 @@ description: >
 
 This skill governs how to run an imaging session end to end using the `seestar-mcp`
 tools. Follow the phases in order. Do not skip pre-flight. Treat every motion command
-(goto, autofocus, park) as state-changing and confirm it succeeded before proceeding.
+(goto, autofocus, park) as state-changing and confirm it succeeded before proceeding:
+`ok: true` first — every motion tool returns `ok: false` when the scope answers with a
+native error (`{"error": ..., "code": ...}`, e.g. `"method not found (code 103)"`) —
+then the command's own signal: `get_view_state` progress for a goto (Phase 1), the
+focuser position for autofocus (Phase 2), `get_status.mount_parked == true` for a park.
 
 ## Operating assumptions
 - `seestar-mcp` is already registered and the Claude Code session is running on the
@@ -174,10 +178,11 @@ something outside the agent will run it.
    established and record the position from `get_focuser_position` as the session baseline
    for drift detection.
 2. **`run_autofocus` is optional and firmware-dependent.** The MCP tool exists, but on some
-   firmware the underlying device method is unavailable and the call returns an error. Use
-   it only for a *deliberate mid-session refocus* (see the focus-drift branch in
-   anomaly-playbook). **Never block a session on it** — if it errors, you already have the
-   focus established during acquisition.
+   firmware the underlying device method is unavailable and the call returns `ok: false`
+   with `"method not found (code 103)"`. Use it only for a *deliberate mid-session
+   refocus* (see the focus-drift branch in anomaly-playbook). **Never block a session on
+   it** — if it returns `ok: false`, you already have the focus established during
+   acquisition.
 3. If the focuser position is implausible, or stars look soft in the Phase 4 framing check,
    hand off to the anomaly-playbook skill (focus branch) rather than improvising.
 
@@ -228,7 +233,8 @@ compact and phone-friendly — one line, lead with state.
   `check_night_guardrails`. A target slot can run 45+ minutes, and precipitation, dew, or a
   falling battery do not wait for a slot boundary — checking only between targets leaves the
   whole slot unguarded. A `park_and_stop` verdict wins immediately: end the slot and wind
-  down (see `autonomous-night` Phase C).
+  down (see `autonomous-night` Phase C). So does a check that fails (`ok: false`) — the
+  guardrail fails closed (`autonomous-night` Phase B step 1).
 - **Keep the tool link warm (~every 5 min while running background work).** An MCP
   connection that goes quiet gets dropped: a client polling continuously survived 8.8 h,
   while sessions with 40–60 min silences died repeatedly mid-run. If you are watching a long
@@ -312,8 +318,10 @@ the session run quietly.
    - `median_fwhm` is the report's median FWHM if present (omit if not).
    Then state the updated project progress in one line:
    `M31 logged: +25 min → 3.0 h of 6 h.`
-5. If the user is done for the night, `park` the mount (and `shutdown` only if they ask
-   — shutdown ends the seestar_alp link).
+5. If the user is done for the night, `park` the mount and confirm the fold:
+   `get_status.mount_parked` is `true` (poll briefly — the fold takes a moment). Not
+   `tracking`, which is Alpaca's view and disagrees with the device on this hardware.
+   `shutdown` only if they ask — shutdown ends the seestar_alp link.
 
 ## Hard rules
 - Never start stacking on a failed plate-solve.
@@ -324,7 +332,9 @@ the session run quietly.
 - Treat Alt-Az rotation trailing — eccentricity rising while FWHM holds, worst near the
   zenith — as expected; do not raise it as a fault. Never dismiss *rising FWHM with round
   stars* that way: that is dew or focus, and it is correctable.
-- Confirm each motion command's success before issuing the next.
+- Confirm each motion command's success before issuing the next — `ok: true`, then its
+  concrete signal (top of this run-book). A park is confirmed only by
+  `get_status.mount_parked == true`.
 - At wind-down, always log the session to the project (`log_session_result`) so
   integration accumulates toward the goal across nights.
 
@@ -340,8 +350,9 @@ the session run quietly.
 
   The third tier is easy to miss because it generates **no tool call and no provenance
   record** — it is invisible in the audit log while being the traffic most likely to starve
-  the link. `get_status` is also worth knowing about: it fans out to five separate device
-  reads, so it is the most expensive cheap-looking call in the set.
+  the link. `get_status` is also worth knowing about: it fans out to six separate device
+  reads (five Alpaca properties plus one native `get_device_state` for the mount state),
+  so it is the most expensive cheap-looking call in the set.
 - **Do NOT run a heavy file transfer off the scope's share during a session.** Pulling images
   off the scope competes with its control link and can starve it — symptoms range from a
   stalled session to the bridge failing to authenticate. Offload before the session or after

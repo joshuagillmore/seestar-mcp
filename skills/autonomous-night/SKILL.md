@@ -111,13 +111,17 @@ for a different answer, and never resume a stopped run unless the user explicitl
 Record the run's `session_start_utc` at first go-ahead. Then, for each target:
 
 1. **Guardrail check FIRST — every iteration, no exceptions.** Call
-   `check_night_guardrails(session_start_utc=...)`. If it returns
-   `action: "park_and_stop"`, go straight to **Phase C** and quote the hard-stop reason
-   in one line (from `hard_stops` / `reasons`). **Never skip this check between
-   targets.**
-2. Otherwise take the **next `ScheduledTarget`** from the schedule and hand it to the
-   **`run-session`** skill: goto → plate-solve → focus → stack → monitor (the `qa_tier1`
-   cadence plus the Phase 4 live reactivity — conditions watch and sweet-band watch).
+   `check_night_guardrails(session_start_utc=...)`. **It fails closed: proceed ONLY
+   when the result has `ok: true` AND `action: "continue"`.** Anything else —
+   `action: "park_and_stop"`, `ok: false` (no site profile, or the check itself
+   errored), a missing `action`, or any other value — goes straight to **Phase C**.
+   Quote the reason in one line: the hard stop (from `hard_stops` / `reasons`), or the
+   `error` when the check could not run. A check that could not run is a stop, never
+   a pass. **Never skip this check between targets.**
+2. Only on that clean `continue`, take the **next `ScheduledTarget`** from the schedule
+   and hand it to the **`run-session`** skill: goto → plate-solve → focus → stack →
+   monitor (the `qa_tier1` cadence plus the Phase 4 live reactivity — conditions watch
+   and sweet-band watch).
    Notify the user of the target change in one line.
    - **The approved plan is an authorization, not a blank cheque.** The user approved *that
      schedule*. Running it as-is needs no further confirmation, but any **material
@@ -140,19 +144,32 @@ Record the run's `session_start_utc` at first go-ahead. Then, for each target:
    failure, tracking loss, connection drop, weather flip) there. If it resolves, resume
    the loop. If it is an **unrecoverable fault or a hard guardrail stop**, go to Phase C
    — end in `park`. Re-check guardrails on any anomaly, not just at slot boundaries.
+   The Phase A go-ahead already authorised that park: a hard stop or a confirmed weather
+   no-go parks **without asking** (the playbook's precedence rule) — never block on a
+   question nobody is awake to answer.
 
 ## Phase C — Wind down + park
-Reached on any hard stop, unrecoverable fault, end of schedule, or user stop.
+Reached on any hard stop, unrecoverable fault, end of schedule, or user stop. Fold the
+mount before the bookkeeping: logging is local and can wait, the weather cannot.
 1. `stop_view` to end stacking cleanly.
-2. `log_session_result(...)` for the **in-progress** target so its integration is not
-   lost.
-3. **`park`** the mount (stops tracking, optics to horizontal). Parking is
+2. **`park`** the mount (stops tracking, optics to horizontal). Parking is
    non-negotiable on any hard stop.
-4. **Summarize the night** in a compact block and **notify the user**: targets imaged,
+3. **Confirm the fold — a `park` reply is not proof.** Poll `get_status` a few times
+   over ~1–2 min until `mount_parked` is `true`. Read `mount_parked` (the device's own
+   `mount.close`), never `tracking` — that is Alpaca's view and disagrees with the
+   device on this hardware; `mount_parked: null` means the native read failed, which
+   confirms nothing. If `park` returned `ok: false`, or `mount_parked` is still not
+   `true`, **retry `park` once** and confirm again. If it still fails, **alert the user
+   loudly** — a push notification if one is available — and name the backstop, e.g.
+   `PARK NOT CONFIRMED — mount may be unfolded. Dawn watchdog parks at 07:40Z as backstop.`
+4. `log_session_result(...)` for the **in-progress** target so its integration is not
+   lost.
+5. **Summarize the night** in a compact block and **notify the user**: targets imaged,
    integration on each, projects advanced, and the reason the run ended (dawn / battery
    / weather / connection / max duration / schedule complete / user stop).
-5. Only `shutdown` if the user **pre-authorized** it (shutdown ends the seestar_alp
-   link). Otherwise leave the scope parked and connected.
+6. Only `shutdown` if the user **pre-authorized** it **and** step 3 confirmed the park
+   (shutdown ends the seestar_alp link — and with it the watchdog's backstop).
+   Otherwise leave the scope parked and connected.
 
 ## Hard rules
 - **Arming a time-driven heartbeat AND a detached park watchdog is MANDATORY before
@@ -174,7 +191,9 @@ Reached on any hard stop, unrecoverable fault, end of schedule, or user stop.
   surfaces these on the phone).
 - **Fail safe: when in doubt, stop and park.** If scope health can't be confirmed
   (`check_night_guardrails` can't read device state → treated as disconnected), the run
-  stops and parks. Never leave the mount slewed or tracking on a fault.
+  stops and parks. A guardrail call that fails outright (`ok: false`) is a stop too
+  (Phase B step 1), and a park counts only once `get_status.mount_parked` is `true`
+  (Phase C step 3). Never leave the mount slewed or tracking on a fault.
 - **This skill decides *whether to keep going and what's next*; it does not re-implement
   motion** (that is `run-session`). Planning = `observing-planner`, execution =
   `run-session`, faults = `anomaly-playbook`, QA = `qa-policy`.
@@ -233,4 +252,5 @@ Non-obvious behaviors that cost real observing time when ignored.
   `check_night_guardrails` on a slow cadence (~10 min) *during* a slot as well as at each
   boundary. Weather, dew, and battery do not wait for a slot to end, and a 45-minute slot
   checked only at its edges is 45 minutes unguarded — which defeats the lead time the
-  predictive stops exist to give you.
+  predictive stops exist to give you. Read each in-slot result the same fail-closed way
+  as Phase B step 1.
