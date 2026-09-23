@@ -148,9 +148,13 @@ def test_get_view_state_preserves_the_annotation_nesting(tmp_path):
 
 
 def test_get_status_keys_are_present_even_when_unreadable(tmp_path):
-    """Only ``ok`` is required, but the five fields must be PRESENT (may be None).
+    """Only ``ok`` is required, but the fields must be PRESENT (may be None).
 
-    They read all five; absence and null are different failures on their side.
+    They read all five Alpaca fields; absence and null are different failures on
+    their side. v1.2.0 added the native ``mount_parked`` / ``mount_tracking``
+    pair under the same rule: always present, ``None`` when the native read
+    failed. Here ``method_sync`` returns an unparseable mock, so both are None —
+    exactly the case a consumer must still be able to parse.
     """
     c = _controller(tmp_path)
     c.alpaca.get_connected.return_value = True
@@ -162,7 +166,8 @@ def test_get_status_keys_are_present_even_when_unreadable(tmp_path):
     out = asyncio.run(c.get_status())
     _require(
         out,
-        ["ok", "connected", "rightascension", "declination", "tracking", "slewing"],
+        ["ok", "connected", "rightascension", "declination", "tracking", "slewing",
+         "mount_parked", "mount_tracking"],
         "get_status",
     )
 
@@ -631,7 +636,13 @@ def test_plan_targets_contract_and_target_type_vocabulary(tmp_path, monkeypatch)
     monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
     out = asyncio.run(c.plan_targets())
 
-    _require(out, ["ok", "location", "conditions", "count", "targets"], "plan_targets")
+    assert out["ok"] is True
+    # dark_window_utc (v1.2.0) names the night that was planned.
+    _require(
+        out,
+        ["ok", "location", "dark_window_utc", "conditions", "count", "targets"],
+        "plan_targets",
+    )
     for target in out["targets"]:
         _require(
             target,
@@ -746,7 +757,13 @@ def test_get_target_observability_tool_contract(tmp_path, monkeypatch):
     asyncio.run(c.set_site_profile(name="Yard", lat=45.0, lon=-75.0, bortle=6))
     out = asyncio.run(c.get_target_observability("M31"))
 
-    _require(out, ["ok", "target", "observability"], "get_target_observability")
+    assert out["ok"] is True
+    # dark_window_utc (v1.2.0) names the night the observability describes.
+    _require(
+        out,
+        ["ok", "target", "observability", "dark_window_utc"],
+        "get_target_observability",
+    )
     if out.get("observability"):
         _require(
             out["observability"],

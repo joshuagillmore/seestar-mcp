@@ -426,7 +426,16 @@ class SeestarController:
         """Plate-solve the current field: start a solve, then read the result."""
         try:
             # FIRMWARE-DEPENDENT: solve method names.
-            await self.alpaca.method_sync("start_solve")
+            started = await self.alpaca.method_sync("start_solve")
+            # start_solve's reply was discarded, so a rejected solve
+            # ({"error": "fail to operate", "code": 207}) fell through to
+            # get_solve_result, which returns the PREVIOUS solve: ok:true on a
+            # stale solution, under the "never stack on a failed solve" rule
+            # (2026-09-22 final review, F1). Any native error fails here —
+            # including seestar_alp's "Exceeded allotted wait time" string,
+            # which every other command already treats as "did not start".
+            if (bad := _native_fail(started)) is not None:
+                return bad
             result = await self.alpaca.method_sync("get_solve_result")
             if (bad := _native_fail(result)) is not None:
                 return bad

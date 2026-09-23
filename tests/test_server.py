@@ -800,6 +800,79 @@ async def test_run_autofocus_sends_start_auto_focus_then_reads_the_focuser(tmp_p
     assert calls[1].args == ("get_focuser_position", {"ret_obj": True})
 
 
+# --- plate_solve must not report a stale solve (2026-09-22 final review, F1) --
+# plate_solve discarded start_solve's reply. If the scope rejected the solve and
+# get_solve_result then returned the PREVIOUS solve, plate_solve answered ok:true
+# with a stale solution — and plate_solve backs "never stack on a failed solve".
+# The parametrized native-error test above could not see it: its mock rejects
+# BOTH calls, so get_solve_result's own error failed the tool.
+
+#: What get_solve_result hands back after a rejected start_solve: the last
+#: solve the scope completed, for some other field.
+_SOLVE_REPLY = {
+    "jsonrpc": "2.0",
+    "method": "get_solve_result",
+    "result": {"ra_dec": [5.5881, -5.3911], "fov": [0.71, 1.27], "focal_len": 250},
+    "code": 0,
+}
+
+
+def _solve_ctl(tmp_path, start_reply):
+    ctrl = _native_ctl(tmp_path, None)
+    replies = {"start_solve": start_reply, "get_solve_result": _SOLVE_REPLY}
+    ctrl.alpaca.method_sync.side_effect = lambda method, *a, **k: replies[method]
+    return ctrl
+
+
+@pytest.mark.parametrize(
+    "start_reply",
+    [
+        {"error": "fail to operate", "code": 207},
+        dict(NATIVE_ERROR_REPLY),
+    ],
+    ids=["fail_to_operate_207", "method_not_found_103"],
+)
+async def test_plate_solve_fails_when_only_start_solve_is_rejected(
+    tmp_path, start_reply
+):
+    ctrl = _solve_ctl(tmp_path, start_reply)
+    result = await ctrl.plate_solve()
+    assert result["ok"] is False, "a rejected start_solve reported a stale solve"
+    assert start_reply["error"] in result["error"]
+    assert str(start_reply["code"]) in result["error"]
+    # The stale solution must not reach the caller in any field.
+    assert "solve_result" not in result
+    assert "5.5881" not in repr(result)
+    # And it is never even read: nothing after a rejected start is trustworthy.
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve"]
+
+
+async def test_plate_solve_fails_on_a_start_solve_timeout_string(tmp_path):
+    # seestar_alp's own "Exceeded allotted wait time" string means the device
+    # never acknowledged start_solve, so a following get_solve_result may be the
+    # previous solve. Every other command already treats this string as fatal
+    # (goto_target: "the scope did NOT start the view"), so start_solve does too.
+    ctrl = _solve_ctl(tmp_path, "Error: Exceeded allotted wait time for result")
+    result = await ctrl.plate_solve()
+    assert result["ok"] is False
+    assert "Exceeded allotted wait time" in result["error"]
+    assert "solve_result" not in result
+
+
+async def test_plate_solve_accepted_start_returns_the_solve(tmp_path):
+    # No over-trigger: an acknowledged start_solve still reads and returns the
+    # solve, and the call order is pinned (start, then read).
+    ctrl = _solve_ctl(
+        tmp_path, {"jsonrpc": "2.0", "method": "start_solve", "result": 0, "code": 0}
+    )
+    result = await ctrl.plate_solve()
+    assert result["ok"] is True
+    assert result["solve_result"] == _SOLVE_REPLY
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve", "get_solve_result"]
+
+
 # --- get_status carries the authoritative native mount state -----------------
 # Alpaca /tracking and /atpark disagree with the device on fw 7.75 and 8.46;
 # get_device_state's mount.close (True = arm folded) is the authoritative park

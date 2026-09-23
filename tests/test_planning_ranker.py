@@ -1,8 +1,14 @@
 """Tests for the reasoned target ranker (Task 6).
 
-The ranker's astronomy is injected via ``observability_fn`` so these tests are
-fully deterministic and never touch astropy: each case hands the ranker a
-hand-built :class:`Observability` record through the ``_obs`` helper.
+The ranker's per-target astronomy is injected via ``observability_fn`` so the
+scoring cases are deterministic: each hands the ranker a hand-built
+:class:`Observability` record through the ``_obs`` helper. They are not
+astropy-free, though. Since 2026-09-22 (review Task 7) ``rank_targets`` resolves
+the night's dark window once per call with the real, offline
+:func:`~seestar_mcp.planning.astro.dark_window` whenever ``observability_fn``
+accepts ``dark_window_utc`` — as every double here except the three-argument
+one does — and the Task 7 block at the end deliberately runs the real
+``observability`` against real catalog targets.
 """
 
 from __future__ import annotations
@@ -312,3 +318,48 @@ def test_dark_window_computed_once_per_rank_targets_call(monkeypatch):
     rank_targets(site, "2026-07-05T04:00:00Z", cat, _cond())
 
     assert len(calls) == 1, f"dark_window called {len(calls)} times, expected 1"
+
+
+# --- 2026-09-22 final review, F3: old three-argument observability_fn --------
+# Task 7 started calling observability_fn(..., dark_window_utc=window) on every
+# target. An injected double with the pre-Task-7 signature (site, target, when)
+# raised TypeError on each one, the per-target `except` swallowed it, and
+# rank_targets returned [] — a failure that looks exactly like "nothing is up".
+
+
+def test_three_argument_observability_fn_still_ranks(monkeypatch):
+    import seestar_mcp.planning.ranker as ranker_mod
+
+    calls: list[int] = []
+    real_dark_window = ranker_mod.dark_window
+
+    def _counting(site, when):
+        calls.append(1)
+        return real_dark_window(site, when)
+
+    monkeypatch.setattr(ranker_mod, "dark_window", _counting)
+
+    site = SiteProfile(name="x", lat_deg=40, lon_deg=-74, bortle=6)
+    cat = [
+        DsoTarget("A", "A", 0, 0, "emission_nebula", 20, 7),
+        DsoTarget("B", "B", 0, 0, "emission_nebula", 20, 7),
+    ]
+    obs_map = {"A": _obs(120), "B": _obs(20)}
+
+    def old_fn(s, t, w):  # the pre-Task-7 signature: no dark_window_utc
+        return obs_map[t.id]
+
+    plans = rank_targets(site, NOW, cat, _cond(), observability_fn=old_fn)
+
+    assert [p.target.id for p in plans] == ["A", "B"]
+    # Same result as a double that does take the keyword.
+    new = rank_targets(
+        site, NOW, cat, _cond(),
+        observability_fn=lambda s, t, w, dark_window_utc=None: obs_map[t.id],
+    )
+    assert [(p.target.id, p.score) for p in plans] == [
+        (p.target.id, p.score) for p in new
+    ]
+    # Prior behaviour exactly: a window nobody can receive is not computed. Only
+    # the second (keyword-accepting) call resolves one.
+    assert len(calls) == 1
