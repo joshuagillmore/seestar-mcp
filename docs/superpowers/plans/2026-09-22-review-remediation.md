@@ -387,3 +387,51 @@ output. That breaks the rule "if a tool names a quantity, return it as a field".
      `uv run pytest --collect-only -q | tail -1` at the time you edit it.
    - Optional, one line in observing-planner if it fits naturally: a project's "imaged N
      days ago" is now counted from the planned night, not the wall clock.
+
+## Outcome and deferred follow-ups (tranche 2)
+
+Landed on `fix/review-2026-09-22` (faea725..HEAD). Tasks 1-8 and the final-review fix
+wave (F1-F9) all passed task review and a whole-branch review. The suite has 403 tests,
+all passing, and ruff is clean.
+
+Deferred. These are known and outside this tranche:
+
+- **Hardware checks, next night:**
+  - Does `get_status.mount_tracking` read `true` while stacking? It has only been seen
+    `false`, on a folded scope.
+  - What does the firmware reply to `scope_park` when the scope is already folded, to
+    `iscope_stop_view` when idle, and to `start_solve` mid-solve?
+  - How long does the arm take to fold?
+- **First deploy of the systemd unit:** smoke-test startup. `ProtectSystem`,
+  `ProtectHome` and `MemoryDenyWriteExecute` are in effect for the first time; see the
+  unit header.
+- **Offline IERS on the Jetson:** the default `auto_max_age` means predictive obstimes
+  may raise once the cached table is more than 30 days stale. The test suite pins
+  `auto_max_age=None`, so it cannot catch this.
+- **`get_status`:** collapse the five Alpaca reads into the one native
+  `get_device_state`. It currently makes 6 device reads per call; see CONTRACT v1.2.0.
+- **Never-raise gaps:** controller methods catch only `AlpacaError`. JSONDecodeError,
+  OSError, SMB errors and the `data_client` guard's ValueError all escape.
+- **Weather:** the single-slot cache is keyed on moon illumination, and guardrail and
+  planning callers evict each other. `_window_rows` falls back to all rows. The
+  guardrail uses the whole night's worst hour.
+- **Data loss:**
+  - `set_site_profile` wipes the horizon mask.
+  - `load_projects`/`load_sky_log` return `{}` on a schema error, and the next write
+    replaces the store.
+- **QA:** `_resolve_paths` matches on part of the filename (`M3` also matches
+  `M31`/`M33`). `qa_session_report()` with no target globs everything.
+- **Run state:** `STALE_AFTER` is 15 min while slots are 45 min. The state is stamped
+  before the goto succeeds. A future-dated stamp reads as active forever.
+- **Numbers only in prose:** precipitation %, the LP class, and the guardrail's
+  minutes-to-dawn, elapsed hours and battery %.
+- **Geometry:** horizon arcs that wrap 0°/360°. Obstruction bins are not keyed by site.
+- **Repo-wide line endings:** a `* text=auto eol=lf` rule plus a renormalize commit;
+  10 untouched files are still stored as CRLF.
+- **Small wording items:**
+  - `anomaly-playbook` ~line 81 still says "confirmed (go False / cloud rising)".
+  - The `ranker.py` module docstring ("deterministic without astropy") is stale.
+  - `test_observability_dark_window_utc_none_matches_old_output` compares the same
+    branch twice.
+  - `plate_solve`/`_native_error` render a JSON-RPC 2.0 error object that has no
+    message awkwardly.
