@@ -13,6 +13,14 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   `AUTHORS` file, GitHub Actions CI (Linux + Windows), and issue/PR templates.
 - Packaging metadata in `pyproject.toml` (SPDX license, authors, keywords, classifiers,
   project URLs).
+- `python -m seestar_mcp.slot_watch`: a standalone slot watcher for a Claude Code Monitor.
+  It polls only `get_view_state` and prints one line per stacking event (stage/target
+  change, a drop burst, a stacked-count milestone, a stall, or the session ending) instead
+  of the whole payload every poll. Its native-reply parsing (`_native_error`,
+  `_summarize_view_state`, and friends) moved into a new `native_reply.py` module shared
+  with `server.py`, so both read `observing` identically and the watcher does not pay
+  `server.py`'s FastMCP/astropy/photutils import cost (~5 s vs. ~0.7 s on the dev PC) for a
+  process re-armed every 29 minutes.
 
 ### Removed
 - **Refinement moved to its own repository** (`seestar-refine`, 2026-08-08): the AstroPipe
@@ -56,6 +64,44 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   `start_solve` (`{"error": "fail to operate", "code": 207}`): the start reply was discarded
   and `get_solve_result` handed back the last solution. Any native error from `start_solve`,
   including seestar_alp's timeout string, now returns `ok: false`.
+- A native reply's JSON-RPC envelope can carry a truthy `"error"` string alongside an
+  explicit `code: 0`: the dew heater's native `pi_output_set2` answered every toggle live
+  with `{"error": "expected object param", "code": 0}` while it DID apply the change
+  (confirmed via `get_device_state`'s `heater_enable` flipping each time), so `set_dew_heater`
+  reported a false `ok: false` on a command that had actually worked. `code: 0` is now read as
+  success regardless of the `"error"` text; a missing code is never treated as proof of
+  success, so the existing 103/207/215 failures are unaffected. Every command tool
+  (`goto_target`, `start_stack`, `stop_view`, `run_autofocus`, `set_filter`, `set_dew_heater`,
+  `park`, `shutdown`, `plate_solve`) and the native reads `get_view_state` /
+  `get_focuser_position` now carry an additive `warning` key on success: the firmware's odd
+  text when there was one, else `None`.
+- `plate_solve` called `get_solve_result` immediately after `start_solve` and treated the
+  device's `{"error": "no solve data", "code": 215}` — the solve simply not finished yet — as
+  a failure. It now polls `get_solve_result` every `poll_interval_s` (default ~2 s, floored at
+  0.1 s so `poll_interval_s <= 0` against a device stuck at 215 cannot spin forever) up to
+  `timeout_s` (default ~30 s); this call can now take that long to return. On success it also
+  returns the additive `ra_deg`, `dec_deg`, `angle_deg`, `fov_deg`, `star_number`,
+  `solve_duration_ms` and `waited_s`. `ra_deg`/`dec_deg` are the solver's REPORTED position,
+  not the field centre — on fw 8.46 they sit near the commanded target even when the object is
+  well off-centre in the frame (offline image data: M1's nebula sat ~23′ off-centre while the
+  solved position sat only ~4′ from the catalog position); use `get_view_state.stack.target_px`
+  for framing instead.
+- `qa_tier1`'s trend baseline reset only on a stack-count DECREASE, so switching targets
+  mid-session (with the new target's stack count still rising) kept comparing it against the
+  previous target's baseline and could flag a false `stacking_stalled`. The baseline now also
+  resets on a target-name change, read from a new `target_name` field on the snapshot
+  (`View.target_name` / `Stack.target_name`).
+- `get_target_observability` reported only the whole night's observability, so checking the
+  target's position right now needed a scratch astropy script. It gains a `now` block (`utc`,
+  `alt_deg`, `az_deg`, `above_floor`, `in_sweet_band`) at the REAL current instant, independent
+  of `date` (which only selects which night the rest of the result describes).
+- `get_view_state` exposed only the raw native payload, so every framing/drop check needed to
+  dig `stacked_frame` / `dropped_frame` / `frame_errcode` and the Annotate pixel position out
+  of it by hand. It gains `observing` (`bool`, true only when `View.state == "working"` and
+  `mode != "none"` — a parked scope keeps the ended session's `View`, with `state: "cancel"` /
+  `mode: "none"`) and `stack` (a compact summary of target/stage/counts/plate-solve/framing;
+  `null` only for a fresh `result: {}`, and present — with its final counts — for an ended
+  session).
 
 ### Changed
 - `SECURITY.md`: corrected the tool count (33 + 5), reworded the `seestar_alp` supply-chain

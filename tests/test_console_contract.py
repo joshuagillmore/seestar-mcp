@@ -71,15 +71,22 @@ def test_get_view_state_accepts_an_idle_scope_with_empty_result(tmp_path):
     Console team now treats ``View`` as optional-and-nullable rather than merely
     nullable because of it. If we ever start synthesising a ``View`` here, or
     start erroring on the empty shape, their idle path breaks.
+
+    ``observing``/``stack`` (2026-09-24 live test follow-ups, still v1.2.0) are
+    pinned here too: a fresh ``result: {}`` is the one case ``stack`` is null,
+    and ``observing`` is false -- there is no ``View`` to read ``state``/``mode``
+    from.
     """
     c = _controller(tmp_path)
     c.alpaca.method_sync.return_value = {"jsonrpc": "2.0", "result": {}, "code": 0}
 
     out = asyncio.run(c.get_view_state())
 
-    _require(out, ["ok", "view_state"], "get_view_state")
+    _require(out, ["ok", "view_state", "observing", "stack"], "get_view_state")
     assert out["ok"] is True
     assert out["view_state"]["result"] == {}
+    assert out["observing"] is False
+    assert out["stack"] is None
 
 
 def test_get_view_state_preserves_the_annotation_nesting(tmp_path):

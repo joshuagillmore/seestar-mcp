@@ -101,14 +101,54 @@ to create state; their shapes are not pinned.
   And **`date`** on `assess_conditions`, `plan_targets` and
   `get_target_observability` is read differently: a bare `YYYY-MM-DD` is now the
   site-local date of the night *beginning* that evening (it parsed to 00:00Z —
-  the evening before, in the Americas), and an omitted `date` plans the upcoming
-  night, or the current one once dark, where a morning or midday call used to
-  return the night just ended. Pass the site's calendar date, not the UTC one.
-  An explicit ISO instant inside a night is unaffected.
+  the evening before, in the Americas), and an omitted `date` resolves to the
+  night in progress — from astronomical dusk to astronomical dawn; the next
+  night after dawn — where a morning or midday call used to return the night
+  just ended. Pass the site's calendar date, not the UTC one. An explicit ISO
+  instant inside a night is unaffected. `dark_window_utc`'s edges carry about
+  ±5 min of jitter: they come off a 5-minute Sun-altitude grid anchored at the
+  call's own instant rather than a fixed clock tick, so the same night queried
+  a minute apart can shift the reported edges by up to one grid step.
   *Why:* the 2026-09-22 review found no tool exposed the native mount state, so
   nothing — the run-book skills included — could confirm a park, and a morning
   planning call quietly described last night. `dark_window_utc` lets a caller
   check which night it got.
+
+  **Second addition to v1.2.0 (2026-09-24 live test follow-ups), still
+  unreleased:** five more additive changes. A native reply whose JSON-RPC
+  envelope carries an explicit `code: 0` is now read as success even when its
+  `"error"` text is truthy — the dew heater's native `pi_output_set2` answers
+  every toggle with `{"error": "expected object param", "code": 0}` while it
+  DOES apply the change, confirmed by reading `get_device_state`'s
+  `heater_enable` flip. Every command tool (`goto_target`, `start_stack`,
+  `stop_view`, `run_autofocus`, `set_filter`, `set_dew_heater`, `park`,
+  `shutdown`, `plate_solve`) and the native reads `get_view_state` /
+  `get_focuser_position` now carry an additive `warning` key on success: the
+  firmware's odd text when there was one, else `None`.
+  **`plate_solve`** now polls `get_solve_result` while it answers code 215
+  ("no solve data yet"), up to ~30 s (the default `timeout_s`) — this call can
+  now take that long to return. Its success payload gains `ra_deg`, `dec_deg`,
+  `angle_deg`, `fov_deg`, `star_number`, `solve_duration_ms` and `waited_s`.
+  `ra_deg`/`dec_deg` are the solver's REPORTED position, not the field centre:
+  on fw 8.46 they sit near the commanded target even when the target is well
+  off-centre in the frame — offline image data showed the object ~23′
+  off-centre while the reported position was only ~4′ from it. For framing,
+  use `get_view_state.stack.target_px`, not these fields.
+  **`get_target_observability`** gained a `now` block (`utc`, `alt_deg`,
+  `az_deg`, `above_floor`, `in_sweet_band`): the target's position at the REAL
+  current instant, independent of `date` — `date` only selects which night
+  `dark_window_utc`/`observability` describe.
+  **`get_view_state`** gained `observing` (bool) and `stack` (dict or null).
+  `observing` is true only when `View.state == "working"`. A parked scope
+  keeps the ended session's View (`state` "cancel", `mode` "none"), so a
+  non-empty `result` is not itself "observing". `stack` stays present for an
+  ended session — with its final counts — and is null only for a fresh
+  `result: {}`.
+  *Why:* the live test found every one of these needed a scratch script to dig
+  the same numbers out of raw native replies by hand — a false `ok: false` on
+  a heater toggle that had actually worked, a `plate_solve` that failed
+  outright on a slow solve, and no field answering "is the scope observing
+  right now" or "where is the target really, this instant."
 - **v1.1.1** — `thresholds.eccentricity_marginal` is now guaranteed **finite** and
   **never above `thresholds.eccentricity_reject`**. No shape change; both were
   already true for every real session, and re-scoring the 970-sub reference night
