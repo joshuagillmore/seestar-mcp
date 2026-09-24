@@ -25,6 +25,14 @@ phone-friendly (Remote Control): lead with the verdict, then the top 3.
   times, cloud cover, or the moon — always call the tool and quote what it returns.
 - The Seestar is alt-az: field rotation, not tracking, sets the clean-integration
   limit. The tools already model this (the sweet band + a near-zenith caveat).
+- **Which night.** `assess_conditions`, `plan_targets`, `get_target_observability` and
+  `simulate_night` share one `date` rule: omitted means tonight — the coming evening
+  from a morning or afternoon call, the current night once it is dark — and a bare
+  site-local date (`YYYY-MM-DD`) means the night *beginning* that date's evening. Pass
+  the site's calendar date, not today's UTC date: after 00:00Z in the Americas the UTC
+  date is already tomorrow, which plans tomorrow night. Each returns
+  `dark_window_utc`; quote it when the date could be ambiguous. Everything is relative
+  to that night, including a project's `imaged Nd ago`.
 
 ## Phase 0 — Conditions (go/no-go)
 1. Ensure a **site profile** exists: `get_site_profile`. If it returns none, either

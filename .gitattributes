@@ -1,0 +1,10 @@
+# Force LF on the files that ship to the Linux Jetson, regardless of a
+# developer's core.autocrlf on Windows. Added 2026-09-22 (task-4 fix round 1):
+# commit 5c5e6ab converted deploy/seestar-mcp.service to CRLF on checkout,
+# and systemd < v246 (JetPack 5.x ships 245) does not strip a trailing \r
+# from a directive's value, so every directive would have been silently
+# corrupted the same way the inline-comment bug corrupted seven of them.
+# `eol=lf` overrides core.autocrlf for these paths on every platform, so a
+# Windows checkout can't reintroduce CRLF here.
+deploy/*.service text eol=lf
+deploy/*.sh text eol=lf

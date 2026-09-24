@@ -67,19 +67,28 @@ def _require(payload: dict, keys: list[str], where: str) -> None:
 def test_get_view_state_accepts_an_idle_scope_with_empty_result(tmp_path):
     """``result: {}`` with no ``View`` key must stay valid.
 
-    This is the most common real response — a connected, idle scope — and the
-    Console team now treats ``View`` as optional-and-nullable rather than merely
-    nullable because of it. If we ever start synthesising a ``View`` here, or
-    start erroring on the empty shape, their idle path breaks.
+    This is what a freshly booted scope returns, and the Console team treats
+    ``View`` as optional-and-nullable rather than merely nullable because of
+    it. A parked or ended session does NOT return it: it keeps its ``View``
+    (``state`` "cancel", ``mode`` "none"), so ``observing`` -- not an empty
+    ``result`` -- is the running test. If we ever start synthesising a ``View``
+    here, or start erroring on the empty shape, their fresh-boot path breaks.
+
+    ``observing``/``stack`` (2026-09-24 live test follow-ups, still v1.2.0) are
+    pinned here too: a fresh ``result: {}`` is the one case ``stack`` is null,
+    and ``observing`` is false -- there is no ``View`` to read ``state``/``mode``
+    from.
     """
     c = _controller(tmp_path)
     c.alpaca.method_sync.return_value = {"jsonrpc": "2.0", "result": {}, "code": 0}
 
     out = asyncio.run(c.get_view_state())
 
-    _require(out, ["ok", "view_state"], "get_view_state")
+    _require(out, ["ok", "view_state", "observing", "stack"], "get_view_state")
     assert out["ok"] is True
     assert out["view_state"]["result"] == {}
+    assert out["observing"] is False
+    assert out["stack"] is None
 
 
 def test_get_view_state_preserves_the_annotation_nesting(tmp_path):
@@ -148,9 +157,13 @@ def test_get_view_state_preserves_the_annotation_nesting(tmp_path):
 
 
 def test_get_status_keys_are_present_even_when_unreadable(tmp_path):
-    """Only ``ok`` is required, but the five fields must be PRESENT (may be None).
+    """Only ``ok`` is required, but the fields must be PRESENT (may be None).
 
-    They read all five; absence and null are different failures on their side.
+    They read all five Alpaca fields; absence and null are different failures on
+    their side. v1.2.0 added the native ``mount_parked`` / ``mount_tracking``
+    pair under the same rule: always present, ``None`` when the native read
+    failed. Here ``method_sync`` returns an unparseable mock, so both are None —
+    exactly the case a consumer must still be able to parse.
     """
     c = _controller(tmp_path)
     c.alpaca.get_connected.return_value = True
@@ -162,7 +175,8 @@ def test_get_status_keys_are_present_even_when_unreadable(tmp_path):
     out = asyncio.run(c.get_status())
     _require(
         out,
-        ["ok", "connected", "rightascension", "declination", "tracking", "slewing"],
+        ["ok", "connected", "rightascension", "declination", "tracking", "slewing",
+         "mount_parked", "mount_tracking"],
         "get_status",
     )
 
@@ -631,7 +645,13 @@ def test_plan_targets_contract_and_target_type_vocabulary(tmp_path, monkeypatch)
     monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
     out = asyncio.run(c.plan_targets())
 
-    _require(out, ["ok", "location", "conditions", "count", "targets"], "plan_targets")
+    assert out["ok"] is True
+    # dark_window_utc (v1.2.0) names the night that was planned.
+    _require(
+        out,
+        ["ok", "location", "dark_window_utc", "conditions", "count", "targets"],
+        "plan_targets",
+    )
     for target in out["targets"]:
         _require(
             target,
@@ -686,7 +706,7 @@ def test_contract_version_is_declared_and_matches_this_suite():
     title = re.search(r"^# seestar-mcp consumer contract — v(\S+)", contract, re.M)
     assert title, "contract has no versioned title"
     version = title.group(1)
-    assert version == "1.1.1"
+    assert version == "1.2.0"
 
     # The Status table is the field a consumer actually pins against, so it must
     # agree with the title. They drifted apart once (title said 1.0.1, the table
@@ -746,7 +766,20 @@ def test_get_target_observability_tool_contract(tmp_path, monkeypatch):
     asyncio.run(c.set_site_profile(name="Yard", lat=45.0, lon=-75.0, bortle=6))
     out = asyncio.run(c.get_target_observability("M31"))
 
-    _require(out, ["ok", "target", "observability"], "get_target_observability")
+    assert out["ok"] is True
+    # dark_window_utc (v1.2.0) names the night the observability describes;
+    # now (live test 2026-09-24, Task 4) is the target's REAL live position,
+    # present on every ok:true path regardless of dark_window_utc's night.
+    _require(
+        out,
+        ["ok", "target", "observability", "dark_window_utc", "now"],
+        "get_target_observability",
+    )
+    _require(
+        out["now"],
+        ["utc", "alt_deg", "az_deg", "above_floor", "in_sweet_band"],
+        "get_target_observability.now",
+    )
     if out.get("observability"):
         _require(
             out["observability"],

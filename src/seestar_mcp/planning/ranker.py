@@ -24,11 +24,12 @@ injectable so tests stay deterministic without astropy.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
-from .astro import Observability, observability
+from .astro import Observability, dark_window, observability
 from .lightpollution import bortle_for, lp_suitability
 
 if TYPE_CHECKING:
@@ -285,6 +286,28 @@ def _plan_target(
     )
 
 
+def _takes_dark_window(fn: Callable[..., Observability]) -> bool:
+    """Whether ``fn`` can be called with the ``dark_window_utc=`` keyword.
+
+    The default :func:`~.astro.observability` can. An injected double written
+    for the pre-2026-09-22 ``(site, target, when_utc)`` signature cannot, and
+    passing it the keyword raised ``TypeError`` on every target — swallowed per
+    target, so ``rank_targets`` returned ``[]`` (2026-09-22 final review, F3).
+    """
+    if fn is observability:
+        return True
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):  # no introspectable signature: don't guess
+        return False
+    by_name = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == "dark_window_utc" and p.kind in by_name)
+        for p in params
+    )
+
+
 def rank_targets(
     site: SiteProfile,
     when_utc: str,
@@ -294,6 +317,7 @@ def rank_targets(
     types: list[str] | None = None,
     min_alt: float | None = None,
     limit: int | None = None,
+    dark_window_utc: tuple[str, str] | None = None,
     observability_fn: Callable[..., Observability] = observability,
     projects: dict[str, Project] | None = None,
     now_utc: str | None = None,
@@ -310,6 +334,19 @@ def rank_targets(
     go/no-go verdict does not exclude targets (planning still runs on a no-go
     night — the caller annotates the caveat). Never raises.
 
+    **Dark window, computed once (2026-09-22 review, Task 7):** the night's
+    ``(dusk, dawn)`` pair is resolved ONCE per call — from ``dark_window_utc`` if
+    the caller already has it (``plan_targets`` needs the same window for its
+    weather assessment), else freshly via :func:`~.astro.dark_window` — and
+    passed to every ``observability_fn`` call as its own ``dark_window_utc``
+    rather than letting each of up to 120 catalog targets recompute it (that
+    took 120x `observability` from 8.1s to 11.1s after Task 6 widened
+    ``dark_window``'s Sun grid). The keyword goes only to an ``observability_fn``
+    that accepts it — the default does, as does any callable declaring
+    ``dark_window_utc`` or ``**kwargs``. A three-argument
+    ``(site, target, when_utc)`` double is called exactly as before Task 7:
+    positionally, with no window computed for it.
+
     **Project-awareness (optional, backward-compatible):** when ``projects`` (a
     ``{target_id: Project}`` map, already loaded — this function never reads
     disk) is supplied, an active project still short of its goal gets a bounded
@@ -324,10 +361,24 @@ def rank_targets(
             wanted = set(types)
             selected = [t for t in catalog if t.type in wanted]
 
+        # Detected once per call, not per target (F3, see _takes_dark_window).
+        pass_window = _takes_dark_window(observability_fn)
+        window = None
+        if pass_window:
+            window = (
+                dark_window_utc
+                if dark_window_utc is not None
+                else dark_window(site, when_utc)
+            )
+
         plans: list[TargetPlan] = []
         for target in selected:
             try:
-                obs = observability_fn(site, target, when_utc)
+                obs = (
+                    observability_fn(site, target, when_utc, dark_window_utc=window)
+                    if pass_window
+                    else observability_fn(site, target, when_utc)
+                )
             except Exception:  # noqa: BLE001 - a bad target must not sink the batch
                 continue
             if obs.dark_minutes_in_sweet_band <= 0:

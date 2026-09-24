@@ -26,9 +26,11 @@ signature; credentials live only in :mod:`seestar_mcp.secrets`.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import dataclasses
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +40,22 @@ from mcp.server.fastmcp import FastMCP
 
 from .alpaca_client import AlpacaClient, AlpacaError, AlpacaNotImplemented
 from .data_client import DataClient
-from .planning.astro import azalt_at, dark_window, moon_illumination, observability
+
+# The native-reply parsers live in native_reply.py so the slot watcher can share
+# them without importing this module (task 6, live test 2026-09-24).
+from .native_reply import (
+    _native_error,
+    _native_error_parts,
+    _native_warning,
+    _summarize_view_state,
+)
+from .planning.astro import (
+    azalt_at,
+    dark_window,
+    moon_illumination,
+    observability,
+    planning_when,
+)
 from .planning.autonomous import evaluate_guardrails, plan_night
 from .planning.catalog import find_target, load_catalog
 from .planning.obstructions import (
@@ -54,7 +71,7 @@ from .planning.projects import (
     upsert_project,
 )
 from .planning.ranker import rank_targets
-from .planning.site import SiteProfile, load_site, save_site
+from .planning.site import SiteProfile, is_blocked, load_site, save_site
 from .planning.weather import assess_conditions as assess_conditions_weather
 from .provenance import ProvenanceLog, SessionManifest
 from .run_state import RunState, clear_run_state, read_run_state, write_run_state
@@ -99,8 +116,13 @@ class SeestarController:
         #: clock (see CLAUDE.md), and this needs one.
         self._weather_cache: tuple[tuple, float, Any] | None = None
 
+        # Per-session state.
+        self.session_id: str | None = None
+        self.manifest: SessionManifest | None = None
+        self.target: str | None = None
+
     async def _weather_cached(self, site, window, illum):
-        """Weather assessment, reused within ``qa_weather_cache_ttl_s``.
+        """Weather assessment, reused within ``weather_cache_ttl_s``.
 
         Why this exists: ``check_night_guardrails`` consumes exactly ONE value
         from the assessment — the tri-state ``weather_go`` — but each call used
@@ -134,11 +156,6 @@ class SeestarController:
         ttl = max(0.0, float(self.settings.weather_cache_ttl_s))
         self._weather_cache = (key, now + ttl, value)
         return value
-
-        # Per-session state.
-        self.session_id: str | None = None
-        self.manifest: SessionManifest | None = None
-        self.target: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> SeestarController:
@@ -227,8 +244,14 @@ class SeestarController:
     async def get_status(self) -> dict:
         """Read connection + pointing + tracking/slewing state.
 
-        Each field is read independently; a ``NotImplemented`` GET (expected for
-        a few standard ASCOM properties the Seestar lacks) resolves to ``None``.
+        Each Alpaca field is read independently; a ``NotImplemented`` GET
+        (expected for a few standard ASCOM properties the Seestar lacks)
+        resolves to ``None``.
+
+        ``tracking`` is ALPACA's view, which disagrees with the device on fw 7.75
+        and 8.46. ``mount_parked`` / ``mount_tracking`` come from one native
+        ``get_device_state`` call (``result.mount.close`` / ``.tracking``) and
+        are the authoritative fields; see :func:`_parse_mount_state`.
         """
         try:
             self.provenance.log_call(tool="get_status", args={})
@@ -239,18 +262,44 @@ class SeestarController:
                 "tracking": await self._maybe(self.alpaca.get_tracking()),
                 "slewing": await self._maybe(self.alpaca.is_slewing()),
             }
+            # Task 5 (2026-09-22 review remediation): no tool exposed the native
+            # mount state, so the skills could not confirm a park — Alpaca's
+            # /atpark and /tracking disagree with the device on this hardware.
+            # Best-effort and additive: any failure is unknown (None), never a
+            # failed get_status.
+            try:
+                dev = await self.alpaca.method_sync("get_device_state")
+                parked, mount_tracking = _parse_mount_state(dev)
+            except Exception:  # noqa: BLE001 - advisory read, never fatal
+                parked, mount_tracking = (None, None)
+            status["mount_parked"] = parked
+            status["mount_tracking"] = mount_tracking
             return {"ok": True, **status}
         except AlpacaError as exc:
             return _err(exc)
 
     async def get_view_state(self) -> dict:
-        """Read the device's live ``get_view_state`` telemetry (native method)."""
+        """Read the device's live ``get_view_state`` telemetry (native method).
+
+        Adds ``observing`` and ``stack`` (see :func:`_summarize_view_state`)
+        alongside the unchanged raw ``view_state`` -- live test 2026-09-24 found
+        every framing/drop check needed a scratch script to dig
+        ``stacked_frame``/``dropped_frame``/``frame_errcode`` and the Annotate
+        pixel position out of the raw payload by hand.
+        """
         try:
             self.provenance.log_call(tool="get_view_state", args={})
             state = await self.alpaca.method_sync("get_view_state")
             if (bad := _native_fail(state)) is not None:
                 return bad
-            return {"ok": True, "view_state": state}
+            observing, stack = _summarize_view_state(state)
+            return {
+                "ok": True,
+                "view_state": state,
+                "observing": observing,
+                "stack": stack,
+                "warning": _native_warning(state),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -337,6 +386,7 @@ class SeestarController:
                 "dec": dec,
                 "lp_filter": bool(use_lp_filter),
                 "result": result,
+                "warning": _native_warning(result),
             }
         except AlpacaError as exc:
             return _err(exc)
@@ -348,7 +398,7 @@ class SeestarController:
             result = await self.alpaca.method_sync("iscope_start_stack")
             if (bad := _native_fail(result)) is not None:
                 return bad
-            return {"ok": True, "result": result}
+            return {"ok": True, "result": result, "warning": _native_warning(result)}
         except AlpacaError as exc:
             return _err(exc)
 
@@ -359,7 +409,12 @@ class SeestarController:
             result = await self.alpaca.method_sync("iscope_stop_view", [mode])
             if (bad := _native_fail(result, mode=mode)) is not None:
                 return bad
-            return {"ok": True, "mode": mode, "result": result}
+            return {
+                "ok": True,
+                "mode": mode,
+                "result": result,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -380,7 +435,12 @@ class SeestarController:
             except AlpacaError:
                 # Best-effort baseline only; do not fail autofocus on this.
                 focus_pos = None
-            return {"ok": True, "result": result, "focus_pos": focus_pos}
+            return {
+                "ok": True,
+                "result": result,
+                "focus_pos": focus_pos,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -393,19 +453,99 @@ class SeestarController:
             )
             if (bad := _native_fail(focus)) is not None:
                 return bad
-            return {"ok": True, "focuser": focus, "focus_pos": _extract_focus_pos(focus)}
+            return {
+                "ok": True,
+                "focuser": focus,
+                "focus_pos": _extract_focus_pos(focus),
+                "warning": _native_warning(focus),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
-    async def plate_solve(self) -> dict:
-        """Plate-solve the current field: start a solve, then read the result."""
+    async def plate_solve(
+        self, *, poll_interval_s: float = 2.0, timeout_s: float = 30.0
+    ) -> dict:
+        """Plate-solve the current field: start a solve, then poll for the result.
+
+        HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): calling
+        ``get_solve_result`` immediately after ``start_solve`` got
+        ``{"error": "no solve data", "code": 215}`` — the solve had not
+        finished yet — and this used to return a false ``ok: false`` on a
+        solve that was still running. Poll ``get_solve_result`` instead, every
+        ``poll_interval_s`` (default ~2s) up to ``timeout_s`` (default ~30s);
+        this call can take that long to return. Code 215 means "in progress"
+        ONLY inside this polling loop — everywhere else a native 215 is an
+        ordinary error, like any other nonzero code. ``poll_interval_s`` is
+        floored at ``_MIN_POLL_INTERVAL_S`` (0.1s) so the loop is always
+        bounded by ``timeout_s`` regardless of what the caller passes —
+        ``poll_interval_s=0`` against a device stuck at 215 used to spin
+        forever (fix round 1, review finding F1, 2026-09-24). A non-positive
+        ``timeout_s`` fails on the first poll, before any sleep.
+
+        On success the additive fields ``ra_deg``/``dec_deg``/``angle_deg``/
+        ``fov_deg``/``star_number``/``solve_duration_ms`` sit next to the
+        unchanged ``solve_result``, plus ``waited_s`` (how long this call
+        actually spent polling). ``ra_deg``/``dec_deg``/``angle_deg`` are the
+        *solver's reported position* (RA converted from hours to degrees), not
+        the field centre: on fw 8.46 this reported position sits near the
+        commanded target even when the object is well off-centre in the frame
+        — M1's nebula sat ~23' off-centre in the averaged raw subs (matching
+        the live-stack Annotate position) while the solved ``ra_dec`` sat only
+        ~4' from the M1 catalog position. For framing, use the stack Annotate
+        pixel position (``get_view_state``), not these fields.
+        """
         try:
             # FIRMWARE-DEPENDENT: solve method names.
-            await self.alpaca.method_sync("start_solve")
-            result = await self.alpaca.method_sync("get_solve_result")
+            started = await self.alpaca.method_sync("start_solve")
+            # start_solve's reply was discarded, so a rejected solve
+            # ({"error": "fail to operate", "code": 207}) fell through to
+            # get_solve_result, which returns the PREVIOUS solve: ok:true on a
+            # stale solution, under the "never stack on a failed solve" rule
+            # (2026-09-22 final review, F1). Any native error fails here —
+            # including seestar_alp's "Exceeded allotted wait time" string,
+            # which every other command already treats as "did not start".
+            if (bad := _native_fail(started)) is not None:
+                return bad
+
+            # Fix round 1 (review finding F1, 2026-09-24): waited_s only
+            # advanced by poll_interval_s per iteration, so poll_interval_s=0
+            # against a device stuck at code 215 spun the loop forever --
+            # 0 >= timeout_s never became true. Bound the loop independently
+            # of the caller's poll_interval_s by flooring the interval used
+            # for both the sleep and the waited_s accumulation; waited_s still
+            # reports the actual (floored) time spent, never a lie.
+            effective_poll_interval_s = max(poll_interval_s, _MIN_POLL_INTERVAL_S)
+
+            waited_s = 0.0
+            result: Any = None
+            while True:
+                result = await self.alpaca.method_sync("get_solve_result")
+                code = _native_solve_code(result)
+                if code != _SOLVE_IN_PROGRESS_CODE:
+                    break
+                if waited_s >= timeout_s:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"plate_solve timed out after {timeout_s:.1f}s "
+                            f"waiting for the solve (last code {code})"
+                        ),
+                        "raw": result,
+                        "waited_s": waited_s,
+                        "last_code": code,
+                    }
+                await asyncio.sleep(effective_poll_interval_s)
+                waited_s += effective_poll_interval_s
+
             if (bad := _native_fail(result)) is not None:
                 return bad
-            return {"ok": True, "solve_result": result}
+            return {
+                "ok": True,
+                "solve_result": result,
+                "warning": _native_warning(started) or _native_warning(result),
+                "waited_s": waited_s,
+                **_extract_solve_fields(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -433,7 +573,12 @@ class SeestarController:
             result = await self.alpaca.method_sync("set_wheel_position", [position])
             if (bad := _native_fail(result, position=position)) is not None:
                 return bad
-            return {"ok": True, "position": position, "result": result}
+            return {
+                "ok": True,
+                "position": position,
+                "result": result,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -460,6 +605,7 @@ class SeestarController:
                 "ok": True,
                 "heater": bool(on),
                 "result": result,
+                "warning": _native_warning(result),
                 "note": (
                     "Enabling the dew heater changes sensor temperature and "
                     "invalidates existing dark frames; rebuild darks afterwards."
@@ -479,7 +625,7 @@ class SeestarController:
             # it would report a run in progress against a parked mount.
             clear_run_state(self._run_state_path())
             self._run_start_utc = None
-            return {"ok": True, "result": result}
+            return {"ok": True, "result": result, "warning": _native_warning(result)}
         except AlpacaError as exc:
             return _err(exc)
 
@@ -496,6 +642,7 @@ class SeestarController:
             return {
                 "ok": True,
                 "result": result,
+                "warning": _native_warning(result),
                 "note": (
                     "Seestar shutdown issued; this ends the seestar_alp control "
                     "link until the device is powered back on."
@@ -872,16 +1019,22 @@ class SeestarController:
         """Go/no-go sky verdict for tonight: weather + moon over the dark window.
 
         Reads the clock only to resolve "tonight" when ``date`` is omitted. A
-        weather outage degrades to ``go=None`` (non-fatal); planning still runs.
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. A weather outage degrades to ``go=None``
+        (non-fatal); planning still runs.
         """
         from datetime import datetime, timezone
 
         try:
             self.provenance.log_call(tool="assess_conditions", args={"date": date})
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            # Resolved against the site: `date or now` fed straight to dark_window
+            # planned LAST night from a morning call, and a bare date the night
+            # before it (2026-09-22 review).
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             block = await self._location_block(site)
             site_for_engine = (
                 site
@@ -900,28 +1053,67 @@ class SeestarController:
     ) -> dict:
         """Observability of one named DSO tonight (altitude, sweet band, moon).
 
-        Reads the clock only to resolve "tonight" when ``date`` is omitted.
-        Read-only; no device motion.
-        """
-        from datetime import datetime, timezone
+        Reads the clock only to resolve "tonight" when ``date`` is omitted. A
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. Read-only; no device motion.
 
+        The result's ``now`` block is about the target's position at the REAL
+        current instant, independent of ``date``: ``date`` only selects which
+        night ``observability``/``dark_window_utc`` describe (live test
+        2026-09-24, Task 4 — every heartbeat needed a scratch astropy script to
+        get the current altitude/azimuth against the floor and ceiling).
+        """
+        # No local `from datetime import ...` here (unlike this method's
+        # siblings): `datetime`/`timezone` stay the module-level names imported
+        # at the top of this file so tests can monkeypatch `datetime` on this
+        # module directly for the `now` block below, without touching the
+        # stdlib `datetime` module (which astropy also reads internally).
         try:
             self.provenance.log_call(
                 tool="get_target_observability",
                 args={"target": target, "date": date},
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             t = find_target(target)
             if t is None:
                 return {"ok": False, "error": f"unknown target: {target}"}
-            obs = observability(site, t, when)
+            # Named as a field, not just prose (2026-09-22 review, Task 7): the
+            # caller cannot otherwise confirm which night this observability was
+            # computed over, now that `date=None` re-anchors to the upcoming
+            # night. Computed once and handed to observability() below instead
+            # of letting it recompute the same window.
+            window = dark_window(site, when)
+            obs = observability(site, t, when, dark_window_utc=window)
+            # `now`: the REAL current instant, always (never `when`, which
+            # tracks `date`) — this is the only place in the method the clock
+            # is read a second time. Mirrors the exact above_floor/sweet-band
+            # formula `_observability` uses per-sample in astro.py, so `now`
+            # agrees with the rest of the result (live test 2026-09-24, Task 4).
+            now_iso = datetime.now(timezone.utc).isoformat()
+            now_az, now_alt = azalt_at(site, t, now_iso)
+            now_unblocked = not is_blocked(site, now_az, now_alt)
+            now_above_floor = now_alt >= site.min_altitude_deg and now_unblocked
+            now_in_sweet_band = (
+                now_alt >= site.min_altitude_deg
+                and now_alt <= site.field_rotation_ceiling_deg
+                and now_unblocked
+            )
             return {
                 "ok": True,
                 "target": dataclasses.asdict(t),
                 "observability": dataclasses.asdict(obs),
+                "dark_window_utc": window,
+                "now": {
+                    "utc": now_iso,
+                    "alt_deg": now_alt,
+                    "az_deg": now_az,
+                    "above_floor": now_above_floor,
+                    "in_sweet_band": now_in_sweet_band,
+                },
             }
         except Exception as exc:  # noqa: BLE001 - tool-facing never-raise contract
             return {"ok": False, "error": str(exc)}
@@ -937,9 +1129,12 @@ class SeestarController:
     ) -> dict:
         """Rank tonight's best DSO targets — a scored, reasoned shortlist.
 
-        Reads the clock only to resolve "tonight" when ``date`` is omitted.
-        Returns a compact per-target summary (id/name/type/score/reasons/window
-        + key observability numbers) rather than the full nested record.
+        Reads the clock only to resolve "tonight" when ``date`` is omitted. A
+        bare site-local date (``YYYY-MM-DD``) means the night beginning on that
+        date's evening; omitted means tonight (or the current night if already
+        dark) — see :func:`planning_when`. Returns a compact per-target summary
+        (id/name/type/score/reasons/window + key observability numbers) rather
+        than the full nested record.
 
         When ``prefer_projects`` (default), the persisted projects/history store
         is loaded and threaded into the ranker so active projects still short of
@@ -960,10 +1155,12 @@ class SeestarController:
                     "prefer_projects": prefer_projects,
                 },
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            # Idempotent, so simulate_night handing us its resolved instant as
+            # `date` ranks the same night it schedules.
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             # GPS reconcile: if the scope has moved off the saved site, disclose it
             # and run the astronomy against a mask-stripped copy (keep the altitude
             # floor; drop the stale obstruction arcs) so blocked sky is not dropped.
@@ -979,6 +1176,13 @@ class SeestarController:
             projects = (
                 load_projects(self._projects_path()) if prefer_projects else None
             )
+            # Same window already computed above for the weather assessment
+            # (site_for_engine only strips the horizon mask — dark_window
+            # depends solely on lat/lon/elevation, so it is identical to
+            # site's) — hand it to rank_targets instead of letting it, or the
+            # up-to-120 catalog targets under it, recompute it (2026-09-22
+            # review, Task 7: that took 120x `observability` from 8.1s to
+            # 11.1s once Task 6 widened dark_window's Sun grid).
             plans = rank_targets(
                 site_for_engine,
                 when,
@@ -987,6 +1191,7 @@ class SeestarController:
                 types=types,
                 min_alt=min_alt,
                 limit=limit,
+                dark_window_utc=window,
                 projects=projects,
                 now_utc=when,
                 recent_days=avoid_recent_days,
@@ -994,6 +1199,7 @@ class SeestarController:
             return {
                 "ok": True,
                 "location": block,
+                "dark_window_utc": window,
                 "conditions": {
                     "go": conditions.go,
                     "suitability": conditions.suitability,
@@ -1166,17 +1372,20 @@ class SeestarController:
         Reads/computes only — issues NO device motion. Ranks tonight's targets
         via :meth:`plan_targets`, then rotates them through the dark window with
         the pure :func:`plan_night` sequencer (45-min slot cap). Reads the clock
-        only to resolve "tonight" when ``date`` is omitted.
+        only to resolve "tonight" when ``date`` is omitted. A bare site-local
+        date (``YYYY-MM-DD``) means the night beginning on that date's evening;
+        omitted means tonight (or the current night if already dark) — see
+        :func:`planning_when`.
         """
         try:
             self.provenance.log_call(
                 tool="simulate_night",
                 args={"date": date, "types": types, "limit": limit},
             )
-            when = date or datetime.now(timezone.utc).isoformat()
             site = load_site(self._site_path())
             if site is None:
                 return {"ok": False, "error": "no site profile set"}
+            when = planning_when(site, date or datetime.now(timezone.utc).isoformat())
             plan = await self.plan_targets(date=when, types=types, limit=limit)
             if not plan.get("ok"):
                 return plan
@@ -1512,23 +1721,78 @@ def _err(exc: AlpacaError) -> dict:
     }
 
 
-def _native_error(value: Any) -> str | None:
-    """Return an error string if a native action result signals failure, else None.
+#: get_solve_result's native code for "the solve has not finished yet"
+#: (HARDWARE-OBSERVED, fw 8.46, live test 2026-09-24: ``{"error": "no solve
+#: data", "code": 215}`` right after start_solve). Meaningful ONLY inside
+#: :meth:`SeestarController.plate_solve`'s polling loop — everywhere else a
+#: native 215 is an ordinary error, like any other nonzero code.
+_SOLVE_IN_PROGRESS_CODE = 215
 
-    seestar_alp tunnels native JSON-RPC results verbatim inside an otherwise-ok
-    Alpaca envelope. When the device is idle/slow it can return a result *string*
-    like ``"Error: Exceeded allotted wait time for result"`` even though the
-    Alpaca ``ErrorNumber`` is 0. Detect that so the controller surfaces it as
-    ``ok:false`` instead of a false ``ok:true``. Handles both a bare string and a
-    dict whose ``"result"`` is such a string.
+#: Floor for plate_solve's polling interval (fix round 1, review finding F1,
+#: 2026-09-24): waited_s advances by this amount per iteration regardless of
+#: the caller's poll_interval_s, so poll_interval_s<=0 against a device stuck
+#: at code 215 cannot loop forever -- confirmed live to hang past a 3s
+#: wall-clock guard before this floor existed.
+_MIN_POLL_INTERVAL_S = 0.1
+
+
+def _native_solve_code(value: Any) -> Any:
+    """Return a native error dict's ``code``, else ``None``.
+
+    Used only by :meth:`SeestarController.plate_solve` to recognise
+    ``_SOLVE_IN_PROGRESS_CODE`` while polling; a normal success reply (no
+    truthy ``"error"``) yields ``None``, which never equals 215.
     """
-    if isinstance(value, str) and value.strip().lower().startswith("error"):
-        return value
     if isinstance(value, dict):
-        result = value.get("result")
-        if isinstance(result, str) and result.strip().lower().startswith("error"):
-            return result
+        parsed = _native_error_parts(value)
+        if parsed is not None:
+            return parsed[1]
     return None
+
+
+def _extract_solve_fields(value: Any) -> dict:
+    """Best-effort ra_deg/dec_deg/angle_deg/fov_deg/star_number/solve_duration_ms.
+
+    Pulled from ``get_solve_result``'s nested ``result`` object (RA converted
+    from hours to degrees). Never raises: any missing or malformed key yields
+    ``None`` for that field rather than a crash, mirroring
+    :func:`_extract_focus_pos`.
+
+    These are the *solver's reported position*, not the field centre.
+    HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): this reported position
+    sits near the commanded target even when the object is well off-centre in
+    the frame — M1's nebula sat ~23' off-centre in the averaged raw subs
+    (matching the live-stack Annotate position) while the solved ``ra_dec``
+    sat only ~4' from the M1 catalog position, and the FITS header RA/DEC
+    ~1'. For framing, use the stack Annotate pixel position
+    (``get_view_state``), not these fields.
+    """
+    fields: dict[str, Any] = {
+        "ra_deg": None,
+        "dec_deg": None,
+        "angle_deg": None,
+        "fov_deg": None,
+        "star_number": None,
+        "solve_duration_ms": None,
+    }
+    nested = value.get("result") if isinstance(value, dict) else None
+    if not isinstance(nested, dict):
+        return fields
+    ra_dec = nested.get("ra_dec")
+    if (
+        isinstance(ra_dec, (list, tuple))
+        and len(ra_dec) == 2
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in ra_dec)
+    ):
+        fields["ra_deg"] = ra_dec[0] * 15
+        fields["dec_deg"] = ra_dec[1]
+    fields["angle_deg"] = nested.get("angle")
+    fov = nested.get("fov")
+    if isinstance(fov, (list, tuple)) and len(fov) == 2:
+        fields["fov_deg"] = list(fov)
+    fields["star_number"] = nested.get("star_number")
+    fields["solve_duration_ms"] = nested.get("duration_ms")
+    return fields
 
 
 def _native_fail(value: Any, **extra: Any) -> dict | None:
@@ -1643,6 +1907,35 @@ def _parse_device_health(dev: Any) -> tuple[bool, bool]:
     return (True, verified)
 
 
+def _parse_mount_state(dev: Any) -> tuple[bool | None, bool | None]:
+    """Extract ``(parked, tracking)`` from a ``get_device_state`` reply.
+
+    HARDWARE-VALIDATED (fw 7.75 and 8.46): ``result.mount.close`` is ``True``
+    when the arm is folded — the authoritative park signal — and
+    ``result.mount.tracking`` is the device's own tracking flag. Alpaca's
+    ``/atpark`` and ``/tracking`` disagree with both on this hardware (see
+    CLAUDE.md), which is why ``get_status`` carries these beside Alpaca's
+    ``tracking`` (2026-09-22 review remediation, task 5).
+
+    Falls back to a flat ``mount`` dict for simple mocks. Each value is a real
+    ``bool`` or ``None``: an unexpected shape, a missing field or a non-bool
+    value is UNKNOWN, never guessed — a misread park signal is worse than none.
+    """
+    if not isinstance(dev, dict):
+        return (None, None)
+    result = dev.get("result")
+    mount = result.get("mount") if isinstance(result, dict) else None
+    if not isinstance(mount, dict):
+        mount = dev.get("mount")
+    if not isinstance(mount, dict):
+        return (None, None)
+    close, tracking = mount.get("close"), mount.get("tracking")
+    return (
+        close if isinstance(close, bool) else None,
+        tracking if isinstance(tracking, bool) else None,
+    )
+
+
 def _parse_battery(info: Any) -> float | None:
     """Extract battery percent from a ``get_device_state`` or ``pi_get_info`` reply.
 
@@ -1684,6 +1977,47 @@ def _parse_battery(info: Any) -> float | None:
 
 mcp = FastMCP("seestar-mcp")
 
+# Task 3 (2026-09-22 review remediation): FastMCP.__init__() just called the mcp
+# package's configure_logging("INFO"), which is logging.basicConfig(level=INFO,
+# handlers=[RichHandler(stderr)]) on the ROOT logger. httpx logs every request at
+# INFO as `HTTP Request: GET <full-url> "HTTP/1.1 200 OK"`, and the meteoblue
+# weather source (planning/weather.py) carries SEESTAR_METEOBLUE_API_KEY as the
+# `apikey` query param, so every keyed weather fetch was writing the key to
+# stderr -- and so to Claude Code's MCP logs, or journald on the Jetson. This is
+# distinct from the provenance log, which already redacts the key (see
+# provenance.py / SECURITY.md). Raising the httpx/httpcore loggers above INFO
+# silences the request-line log at the source.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _RedactApiKeyFilter(logging.Filter):
+    """Defense in depth for the leak above: strip `apikey=<value>` from any
+    record the httpx logger emits, independent of its level.
+
+    A future change that lowers the httpx logger back to INFO/DEBUG (or a
+    library path that logs the URL at WARNING+) must not silently re-open the
+    leak; this filter keeps the key out regardless. See
+    tests/test_logging_redaction.py, which pins both layers.
+    """
+
+    _PATTERN = re.compile(r"(apikey=)[^&\s\"]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1***REDACTED***", record.msg)
+        if record.args:
+            record.args = tuple(
+                self._PATTERN.sub(r"\1***REDACTED***", str(arg))
+                if self._PATTERN.search(str(arg))
+                else arg
+                for arg in record.args
+            )
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactApiKeyFilter())
+
 _controller: SeestarController | None = None
 
 
@@ -1709,13 +2043,32 @@ async def connect_telescope() -> dict:
 
 @mcp.tool()
 async def get_status() -> dict:
-    """Read connection, RA/Dec pointing, and tracking/slewing state. Read-only."""
+    """Read connection, RA/Dec pointing, and tracking/slewing state. Read-only.
+
+    ``tracking`` is Alpaca's view and is known to disagree with the device on
+    this hardware. ``mount_parked`` (arm folded) and ``mount_tracking`` are the
+    authoritative native fields, read by one native ``get_device_state`` call;
+    each is ``true``/``false``, or ``null`` when that read fails. Confirm a park
+    with ``mount_parked``, not ``tracking``.
+    """
     return await get_controller().get_status()
 
 
 @mcp.tool()
 async def get_view_state() -> dict:
-    """Read the device's live view/stacking telemetry. Read-only."""
+    """Read the device's live view/stacking telemetry. Read-only.
+
+    ``observing`` is ``true`` ONLY while an active session is running
+    (``View.state == "working"`` and ``View.mode != "none"``); it is ``false``
+    for a freshly-booted scope (``result: {}``), an ended/cancelled/parked
+    session, or any other state. ``stack`` is a compact summary (target,
+    stage, stacked/dropped counts, frame_errcode, plate-solve position, and
+    the Annotate framing pixel position for the current target); it is
+    ``null`` only when there is no View at all, and stays present -- with its
+    final counts -- for an ended session. ``solve_ra_deg``/``solve_dec_deg``
+    are the solver's REPORTED position, not the field centre; for framing use
+    ``stack.target_px``.
+    """
     return await get_controller().get_view_state()
 
 
@@ -1761,7 +2114,15 @@ async def get_focuser_position() -> dict:
 
 @mcp.tool()
 async def plate_solve() -> dict:
-    """Plate-solve the current field and return the solution. Read-only pointing."""
+    """Plate-solve the current field and return the solution. Read-only pointing.
+
+    Polls the device while the solve is in progress, up to ~30s, so this call
+    can take that long to return. ``ra_deg``/``dec_deg`` are the solver's
+    reported position (RA converted from hours to degrees). On fw 8.46 that
+    position sits near the COMMANDED target, NOT the field centre, even when
+    the object is well off-centre in the frame. Never judge framing from
+    them: use ``get_view_state`` → ``stack.target_px``.
+    """
     return await get_controller().plate_solve()
 
 
@@ -1926,7 +2287,9 @@ async def assess_conditions(date: str | None = None) -> dict:
 
     Read-only. Only external call is one HTTPS GET to Open-Meteo; a weather
     outage is non-fatal (``go=null`` — assess the sky manually). ``date`` (ISO
-    UTC) overrides "tonight". Every verdict is reason-tagged.
+    UTC instant) overrides "tonight": a bare site-local date (``YYYY-MM-DD``)
+    means the night beginning on that date's evening; omitted means tonight (or
+    the current night if already dark). Every verdict is reason-tagged.
     """
     return await get_controller().assess_conditions(date)
 
@@ -1937,7 +2300,16 @@ async def get_target_observability(target: str, date: str | None = None) -> dict
 
     Read-only, offline (deterministic astropy ephemeris). ``target`` is a
     catalog id or common name (e.g. ``"M27"`` / ``"Dumbbell Nebula"``); ``date``
-    (ISO UTC) overrides "tonight".
+    (ISO UTC instant) overrides "tonight": a bare site-local date
+    (``YYYY-MM-DD``) means the night beginning on that date's evening; omitted
+    means tonight (or the current night if already dark).
+
+    The result's ``now`` block (``utc``/``alt_deg``/``az_deg``/``above_floor``/
+    ``in_sweet_band``) is the target's position at the REAL current instant —
+    unrelated to ``date``, which only selects which night the rest of the
+    result (``observability``, ``dark_window_utc``) describes. Use ``now`` for
+    a live heartbeat check against the floor/ceiling; use ``observability`` for
+    the whole night's plan.
     """
     return await get_controller().get_target_observability(target, date)
 
@@ -1956,7 +2328,9 @@ async def plan_targets(
     shortlist.
 
     Read-only. Optionally filter by ``types`` and ``min_alt`` and cap the count
-    with ``limit``. ``date`` (ISO UTC) overrides "tonight". When
+    with ``limit``. ``date`` (ISO UTC instant) overrides "tonight": a bare
+    site-local date (``YYYY-MM-DD``) means the night beginning on that date's
+    evening; omitted means tonight (or the current night if already dark). When
     ``prefer_projects`` (default) the projects/history store boosts targets that
     still need data and suppresses ones imaged within ``avoid_recent_days``.
     """
@@ -2041,7 +2415,10 @@ async def simulate_night(
     it starts.
 
     Read-only/compute-only: ranks tonight's targets and packs them into the dark
-    window, issuing zero device motion. ``date`` (ISO UTC) overrides "tonight".
+    window, issuing zero device motion. ``date`` (ISO UTC instant) overrides
+    "tonight": a bare site-local date (``YYYY-MM-DD``) means the night beginning
+    on that date's evening; omitted means tonight (or the current night if
+    already dark).
     """
     return await get_controller().simulate_night(date, types, limit)
 

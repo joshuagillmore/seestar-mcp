@@ -4,14 +4,16 @@ Everything here is a pure function of an explicitly injected timestamp
 (``when_utc`` as an ISO-UTC string or :class:`astropy.time.Time`) — nothing
 reads the wall clock, so results are reproducible and tests are stable.
 
-Three public entry points:
+The main public entry points:
 
 * :func:`field_rotation_rate` — the alt-az field-rotation magnitude in deg/hr.
   This is the Seestar's key constraint: rotation is worst near the zenith
   (``cos(alt) -> 0``), so a target that transits high rotates fastest exactly
   when it is best placed.
 * :func:`dark_window` — astronomical dusk/dawn (Sun altitude < -18 deg) for the
-  night containing ``when_utc``.
+  night nearest ``when_utc``.
+* :func:`planning_when` — the instant to plan "the night of ``when_utc``" at:
+  the current night if already dark, else the upcoming one.
 * :func:`observability` — the full :class:`Observability` record for one target,
   sampled across the dark window: the bankable clean time in the sweet band
   ``[min_altitude_deg, field_rotation_ceiling_deg]``, moon geometry, and the
@@ -20,6 +22,7 @@ Three public entry points:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import cos, radians
@@ -164,30 +167,45 @@ def moon_illumination(when_utc: str | Time) -> float:
     return float(0.5 * (1.0 - np.cos(elong)))
 
 
-def _sun_alt_grid(site: SiteProfile, center: Time) -> tuple[Time, np.ndarray]:
-    """Sun altitude (deg) on a +/-12h grid centred on ``center``."""
+def _sun_alt_grid(
+    site: SiteProfile, center: Time, half_width_h: float = 12.0
+) -> tuple[Time, np.ndarray]:
+    """Sun altitude (deg) on a +/-``half_width_h`` grid centred on ``center``.
+
+    ``center`` is always the middle sample, so index ``len(alt) // 2`` is
+    ``center`` itself.
+    """
     loc = _location(site)
-    n = int((24 * 60) / _SUN_STEP_MIN) + 1
-    offsets = np.linspace(-12.0, 12.0, n)  # hours
+    n = int((2 * half_width_h * 60) / _SUN_STEP_MIN) + 1
+    offsets = np.linspace(-half_width_h, half_width_h, n)  # hours
     times = center + offsets * u.hour
     altaz = AltAz(obstime=times, location=loc)
     alt = get_sun(times).transform_to(altaz).alt.deg
     return times, np.asarray(alt)
 
 
-def dark_window(site: SiteProfile, when_utc: str | Time) -> tuple[str, str]:
-    """Astronomical dusk/dawn (Sun < -18 deg) for the night containing ``when_utc``.
+# The night is SELECTED within +/-12h of `when` ("nearest night") but its span is
+# EXPANDED on +/-24h. The old single +/-12h grid clipped whichever end of the
+# night fell outside it: at lat 38.9 / lon -77 a 16:00 EDT call got dawn 08:00Z
+# instead of ~09:25Z (2026-09-22 review). The darkest sample is within 12h of
+# `when` and within about an hour of solar midnight, so +/-24h leaves at least
+# 11h of grid either side of that midnight: more than half of any astro-dark
+# night short of polar night, so the expanded span never reaches a grid edge.
+_SELECT_HALF_H = 12.0
+_EXPAND_HALF_H = 24.0
 
-    Builds a +/-12h Sun-altitude grid at ~5-min steps, finds the darkest sample
-    (Sun lowest), and returns the ISO-UTC start/end of the contiguous sub--18deg
-    span that contains it. If the Sun never drops below -18deg (e.g. high summer
-    latitudes), it falls back to the contiguous span around the darkest sample so
-    it never raises.
+
+def _night_span(alt: np.ndarray) -> tuple[int, int]:
+    """Grid indices ``(lo, hi)`` of the night :func:`dark_window` selects.
+
+    ``alt`` is a +/-``_EXPAND_HALF_H`` grid from :func:`_sun_alt_grid`. The
+    darkest sample is chosen only within the central +/-``_SELECT_HALF_H`` (so
+    the same night is selected as before the grid widened), then the contiguous
+    span around it is expanded over the whole grid.
     """
-    center = _to_time(when_utc)
-    times, alt = _sun_alt_grid(site, center)
-
-    darkest = int(np.argmin(alt))
+    mid = len(alt) // 2
+    k = int((_SELECT_HALF_H * 60) / _SUN_STEP_MIN)
+    darkest = mid - k + int(np.argmin(alt[mid - k : mid + k + 1]))
     below = alt < _ASTRO_DARK_ALT_DEG
     if not below[darkest]:
         # Sun never reaches astro dark; approximate with the span whose Sun
@@ -202,7 +220,65 @@ def dark_window(site: SiteProfile, when_utc: str | Time) -> tuple[str, str]:
     hi = darkest
     while hi + 1 < len(below) and below[hi + 1]:
         hi += 1
+    return lo, hi
+
+
+def dark_window(site: SiteProfile, when_utc: str | Time) -> tuple[str, str]:
+    """Astronomical dusk/dawn (Sun < -18 deg) for the night NEAREST ``when_utc``.
+
+    Finds the darkest sample (Sun lowest) within +/-12h of ``when_utc`` on a
+    ~5-min Sun-altitude grid and returns the ISO-UTC start/end of the contiguous
+    sub--18deg span that contains it, expanded on a +/-24h grid so neither end is
+    clipped. "Nearest" means that after dawn this is still the night that just
+    ended (the guardrail's dawn stop depends on it), and before noon it is LAST
+    night — planning tools resolve their instant with :func:`planning_when`
+    first. If the Sun never drops below -18deg (e.g. high summer latitudes), it
+    falls back to the contiguous span around the darkest sample so it never
+    raises.
+    """
+    center = _to_time(when_utc)
+    times, alt = _sun_alt_grid(site, center, _EXPAND_HALF_H)
+    lo, hi = _night_span(alt)
     return _iso(times[lo]), _iso(times[hi])
+
+
+_BARE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def planning_when(site: SiteProfile, when_utc: str | Time) -> str:
+    """The instant the planning tools should evaluate as "the night of ``when_utc``".
+
+    :func:`dark_window` answers "the nearest night", which from a morning or
+    midday call is LAST night, and a bare ``"2026-09-22"`` parses to 00:00Z,
+    i.e. the evening of the 21st in the Americas (2026-09-22 review). Observers
+    mean the night that BEGINS on that date's evening, so:
+
+    * a bare ``YYYY-MM-DD`` is anchored to local mean solar noon of that date
+      (``12:00 UTC - lon_deg/15`` hours, lon east-positive);
+    * an instant inside the window :func:`dark_window` selects for it is
+      returned unchanged — "tonight" while already dark is the current night;
+    * otherwise the next solar minimum (the lowest Sun sample in
+      ``[instant, instant + 24h]``) is returned. It lies inside the upcoming
+      night, so ``dark_window``, ``observability`` and ``moon_illumination``
+      evaluated there all agree on that night.
+
+    Idempotent (the result is always inside its own window, including the
+    never-astro-dark fallback span) and pure: no clock read. Returns an ISO-UTC
+    string in the same naive format as :func:`dark_window`.
+    """
+    if isinstance(when_utc, str) and _BARE_DATE.match(when_utc.strip()):
+        noon = Time(f"{when_utc.strip()}T12:00:00", scale="utc")
+        instant = noon - (site.lon_deg / 15.0) * u.hour
+    else:
+        instant = _to_time(when_utc)
+
+    times, alt = _sun_alt_grid(site, instant, _EXPAND_HALF_H)
+    mid = len(alt) // 2  # == instant
+    lo, hi = _night_span(alt)
+    if lo <= mid <= hi:
+        return _iso(instant)
+    # The forward half of the same grid is exactly [instant, instant + 24h].
+    return _iso(times[mid + int(np.argmin(alt[mid:]))])
 
 
 def _empty_observability(target_id: str) -> Observability:
@@ -229,6 +305,7 @@ def observability(
     site: SiteProfile,
     target: DsoTarget,
     when_utc: str | Time,
+    dark_window_utc: tuple[str, str] | None = None,
 ) -> Observability:
     """Full :class:`Observability` for ``target`` over the night's dark window.
 
@@ -238,9 +315,17 @@ def observability(
     mask via :func:`is_blocked`). Adds transit geometry, moon separation /
     altitude / illumination at transit, and the field-rotation-limited usable sub
     length. Never raises: on any error it returns a zeroed record.
+
+    ``dark_window_utc``, if given, is used as the ``(dusk_iso, dawn_iso)`` pair
+    instead of calling :func:`dark_window` again — ADDITIVE and optional
+    (2026-09-22 review, Task 7): ``rank_targets`` computes the window once per
+    call and hands it to every target instead of each of 120 catalog targets
+    recomputing it (dark_window went 33 -> 64ms once Task 6 widened its Sun
+    grid, taking 120x `observability` from 8.1s to 11.1s). ``None`` (the
+    default) reproduces the prior behaviour exactly.
     """
     try:
-        return _observability(site, target, when_utc)
+        return _observability(site, target, when_utc, dark_window_utc)
     except Exception:  # noqa: BLE001 - never-raise contract; degrade to a zeroed record
         return _empty_observability(target.id if target is not None else "unknown")
 
@@ -249,9 +334,12 @@ def _observability(
     site: SiteProfile,
     target: DsoTarget,
     when_utc: str | Time,
+    dark_window_utc: tuple[str, str] | None = None,
 ) -> Observability:
     loc = _location(site)
-    dusk_iso, dawn_iso = dark_window(site, when_utc)
+    dusk_iso, dawn_iso = (
+        dark_window_utc if dark_window_utc is not None else dark_window(site, when_utc)
+    )
     dusk = _to_time(dusk_iso)
     dawn = _to_time(dawn_iso)
 

@@ -32,7 +32,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -103,6 +103,18 @@ def _safe_name(raw: str) -> str:
     if candidate in ("", ".", ".."):
         return ""
     return candidate
+
+
+def _has_windows_path_syntax(name: str) -> bool:
+    """True if ``name`` holds a backslash or a Windows drive (``C:``, ``\\\\host``).
+
+    The scope's filesystem is Linux, so no genuine sub name carries either. But
+    pathlib only reads them as path syntax on Windows: ``C:\\Windows\\evil.fits``
+    escaped the data dir there yet was one harmless filename on POSIX, so the
+    containment guard gave a different answer per platform (2026-09-22 review).
+    A pure string check refuses them everywhere.
+    """
+    return "\\" in name or bool(PureWindowsPath(name).drive)
 
 
 def _is_fits(name: str) -> bool:
@@ -433,8 +445,13 @@ class DataClient:
             # names are basenamed at the source, a SubInfo may be constructed
             # directly, so prove the resolved write path stays inside dest_dir
             # BEFORE touching the network. Fail closed + audit on any escape.
-            local_path = (dest_dir / sub.name).resolve()
-            if not local_path.is_relative_to(dest_root):
+            # Windows path syntax is refused before resolve(): on Windows,
+            # resolving a UNC name would itself reach out to that host.
+            if _has_windows_path_syntax(sub.name):
+                local_path = None
+            else:
+                local_path = (dest_dir / sub.name).resolve()
+            if local_path is None or not local_path.is_relative_to(dest_root):
                 self._log(
                     tool="data.download.rejected",
                     args={"name": sub.name},

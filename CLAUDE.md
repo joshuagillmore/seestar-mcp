@@ -16,7 +16,7 @@ destructive. Runs on a Jetson, driven from the Claude phone app via Remote Contr
 There is **no bare `python`** on the dev machine (Windows Store shim). Always:
 
 ```bash
-uv run pytest            # full suite (300 tests, all green)
+uv run pytest            # full suite (496 tests, all green)
 uv run ruff check src tests
 uv run python -m seestar_mcp.server   # launch the MCP server (stdio)
 uv run python -c "..."   # one-off checks
@@ -50,6 +50,10 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
     `projects.py`, `obstructions.py` (learned mask), `autonomous.py` (guardrails + scheduler).
   - `run_state.py` — persisted tri-valued run state, so a restarted server can answer
     "is a run underway, and what is it doing?" without inference.
+  - `native_reply.py` — pure parsers for native replies (`_native_error`, `_summarize_view_state`),
+    shared by `server.py` and `slot_watch.py` so both read `observing` identically.
+  - `slot_watch.py` — the shipped slot watcher (`python -m seestar_mcp.slot_watch`): polls only
+    `get_view_state` and prints one line per stacking event for a Claude Code Monitor.
   - `config.py` (pydantic-settings, `SEESTAR_` env prefix), `provenance.py`, `secrets.py`.
 
 ## Non-negotiable conventions
@@ -92,7 +96,10 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
     spellings all return `method not found` (code 103). There is probably no native listing
     RPC; harmless because `list_subs` prefers the SMB/filesystem path when `image_root` is set.
   - `get_view_state` — confirmed on fw 7.75 and still valid on 8.46:
-    `result.View.Stack.stacked_frame` / `dropped_frame`, and `result: {}` on an idle scope.
+    `result.View.Stack.stacked_frame` / `dropped_frame`. `result: {}` appears only on a
+    fresh boot — a PARKED scope keeps the ended session's `View`, with `state: "cancel"`
+    and `mode: "none"` (live test 2026-09-24), so "observing" means `View.state ==
+    "working"` AND `View.mode != "none"`, not "`result` is non-empty".
 - **Filter wheel indices (fw 8.46, hardware-verified):** `0 = dark`, `1 = IRCUT`, `2 = LP`. The
   device reports its own mapping via `get_wheel_setting`; read the current index with
   `get_wheel_position` and busy/idle with `get_wheel_state`. Prefer reading the mapping over
@@ -101,6 +108,8 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
   Alpaca `/atpark` and `/tracking` reported `false`/`true` while the device reported
   `mount.close: true` (folded) and `mount.tracking: false`. Reproduced on both 7.75 and 8.46.
   Anything deciding whether the scope is parked or tracking must read the native state.
+- **Firmware replies `{"error": ..., "code": 0}` from `pi_output_set2` although the change
+  applies — code 0 is success (live test 2026-09-24).**
 - **Line endings:** commit with `git -c core.autocrlf=false commit`. Commit diff stats can look
   inflated (CRLF↔LF renormalization) — the content diff is what matters; tests are the gate.
 - **Field rotation (alt-az):** rank on *sweet-band* time `[min_alt, ~60° ceiling]`, NOT raw

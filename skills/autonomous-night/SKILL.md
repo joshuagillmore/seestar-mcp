@@ -44,6 +44,8 @@ Before proposing anything, arm both:
    event `Monitor` is silent when nothing is wrong and therefore leaves the run
    unsupervised through every *normal* decision (goal reached, altitude floor,
    scheduled switch). A Monitor supplements the heartbeat; it never replaces it.
+   Use the shipped slot watcher (`python -m seestar_mcp.slot_watch`) as the
+   Monitor's source; the command and its event lines are in `run-session` Phase 0.
 2. **A detached park watchdog** — use the shipped
    **`deploy/dawn_park_watchdog.sh`**; do not hand-roll one:
 
@@ -80,9 +82,10 @@ multi-target schedule you have no mechanism to execute.
      `1. M27 · 22:40–00:10 UTC · 90 min · 540×10s · long sweet-band pass, suits site.`
    - the **guardrail defaults** that will apply: dawn margin (15 min), battery floor
      (20%), max session (10 h), weather no-go stops.
-   - a note that **each target spends ~2–4 min acquiring** (alignment + autofocus) before
-     its first frame stacks, so a 45-min slot yields roughly 42 min of integration. Do not
-     promise the full slot as integration time.
+   - a note that **the first target spends ~2–4 min acquiring** (full alignment +
+     autofocus) and **later ones often ~1–2 min** before the first frame stacks, so a
+     45-min slot yields roughly 41–44 min of integration. Do not promise the full slot as
+     integration time.
 4. **State plainly that this is a dry run and REQUIRE explicit user confirmation before
    ANY motion command.** Say it in one line, e.g.
    `Dry run only — nothing has moved. Reply "go" to start the run; I'll park at dawn or on any hard stop.`
@@ -111,22 +114,28 @@ for a different answer, and never resume a stopped run unless the user explicitl
 Record the run's `session_start_utc` at first go-ahead. Then, for each target:
 
 1. **Guardrail check FIRST — every iteration, no exceptions.** Call
-   `check_night_guardrails(session_start_utc=...)`. If it returns
-   `action: "park_and_stop"`, go straight to **Phase C** and quote the hard-stop reason
-   in one line (from `hard_stops` / `reasons`). **Never skip this check between
-   targets.**
-2. Otherwise take the **next `ScheduledTarget`** from the schedule and hand it to the
-   **`run-session`** skill: goto → plate-solve → focus → stack → monitor (the `qa_tier1`
-   cadence plus the Phase 4 live reactivity — conditions watch and sweet-band watch).
+   `check_night_guardrails(session_start_utc=...)`. **It fails closed: proceed ONLY
+   when the result has `ok: true` AND `action: "continue"`.** Anything else —
+   `action: "park_and_stop"`, `ok: false` (no site profile, or the check itself
+   errored), a missing `action`, or any other value — goes straight to **Phase C**.
+   Quote the reason in one line: the hard stop (from `hard_stops` / `reasons`), or the
+   `error` when the check could not run. A check that could not run is a stop, never
+   a pass. **Never skip this check between targets.**
+2. Only on that clean `continue`, take the **next `ScheduledTarget`** from the schedule
+   and hand it to the **`run-session`** skill: goto → plate-solve → focus → stack →
+   monitor (the `qa_tier1` cadence plus the Phase 4 live reactivity — conditions watch
+   and sweet-band watch).
    Notify the user of the target change in one line.
    - **The approved plan is an authorization, not a blank cheque.** The user approved *that
      schedule*. Running it as-is needs no further confirmation, but any **material
      deviation** — skipping a target, substituting one that was not in the dry run,
      reordering, or materially extending a slot — must be **surfaced in one line as it
      happens**, with the reason. Skipping an obstructed target and moving on is fine and
-     expected; doing it silently is not. Anything that would take the night somewhere the
-     user did not see in the dry run (a target off-plan, the dew heater, a mask edit) needs
-     a fresh confirmation.
+     expected; doing it silently is not. The same holds for re-acquiring the same target
+     broadband when the LP filter drops frames under the moon (the anomaly-playbook
+     LP-filter branch): no fresh confirmation, one line as it happens. Anything that
+     would take the night somewhere the user did not see in the dry run (a target
+     off-plan, the dew heater, a mask edit) needs a fresh confirmation.
    - **When a target is blocked, check its neighbours before slewing.** A local obstruction
      is a *direction*, not a single target: before taking the next item, scan the remaining
      plan for targets at similar azimuth and **lower** altitude and skip them together.
@@ -140,19 +149,45 @@ Record the run's `session_start_utc` at first go-ahead. Then, for each target:
    failure, tracking loss, connection drop, weather flip) there. If it resolves, resume
    the loop. If it is an **unrecoverable fault or a hard guardrail stop**, go to Phase C
    — end in `park`. Re-check guardrails on any anomaly, not just at slot boundaries.
+   The Phase A go-ahead already authorised that park: a hard stop or a confirmed weather
+   no-go (`assess_conditions` returned `go: false`) parks **without asking** (the
+   playbook's precedence rule) — never block on a question nobody is awake to answer.
+   Cloud rising while `go` is still `true` (or `null`) is not a no-go and does not end
+   the night on its own.
 
 ## Phase C — Wind down + park
-Reached on any hard stop, unrecoverable fault, end of schedule, or user stop.
-1. `stop_view` to end stacking cleanly.
-2. `log_session_result(...)` for the **in-progress** target so its integration is not
-   lost.
-3. **`park`** the mount (stops tracking, optics to horizontal). Parking is
+Reached on any hard stop, unrecoverable fault, end of schedule, or user stop. Fold the
+mount before the bookkeeping: logging is local and can wait, the weather cannot.
+1. `stop_view` to end stacking cleanly. **Go on to `park` whatever it returns** — a
+   native error now comes back `ok: false`, and a failed `stop_view` must never stall
+   the wind-down.
+2. **`park`** the mount (stops tracking, optics to horizontal). Parking is
    non-negotiable on any hard stop.
-4. **Summarize the night** in a compact block and **notify the user**: targets imaged,
+3. **Confirm the fold — the `park` reply is not proof either way.** Poll `get_status`
+   about every 30 s for up to ~4 min until `mount_parked` is `true`. The fold typically
+   completes in ~20–30 s (live test 2026-09-24), but ~4 min is the upper bound: a
+   shorter poll re-parks a mount that is still folding and raises a false alarm. Read
+   `mount_parked` (the device's own `mount.close`), never `tracking` — that
+   is Alpaca's view and disagrees with the device on this hardware; `mount_parked: null`
+   means the native read failed, which confirms nothing. **A confirmed
+   `mount_parked: true` is parked, even if `park` returned `ok: false`.** Only when the
+   fold is still **not** confirmed at the end of the poll, **retry `park` once** (a
+   repeat `park` on an already-folded scope returns code 0 and is harmless, live test
+   2026-09-24) and poll again the same way. If it still fails, **alert the user
+   loudly** — a push notification if one is available — and name the backstop, e.g.
+   `PARK NOT CONFIRMED — mount may be unfolded. Dawn watchdog parks at 07:40Z as backstop.`
+   If `park` returned `ok: false` but the fold was then confirmed, `get_run_state` may
+   still read `active` (or `unknown` once its stamp goes stale), because `park` clears
+   the run state only on `ok: true`. That is expected: the confirmed fold is what
+   counts, so do not treat that state as a live run.
+4. `log_session_result(...)` for the **in-progress** target so its integration is not
+   lost.
+5. **Summarize the night** in a compact block and **notify the user**: targets imaged,
    integration on each, projects advanced, and the reason the run ended (dawn / battery
    / weather / connection / max duration / schedule complete / user stop).
-5. Only `shutdown` if the user **pre-authorized** it (shutdown ends the seestar_alp
-   link). Otherwise leave the scope parked and connected.
+6. Only `shutdown` if the user **pre-authorized** it **and** step 3 confirmed the park
+   (shutdown ends the seestar_alp link — and with it the watchdog's backstop).
+   Otherwise leave the scope parked and connected.
 
 ## Hard rules
 - **Arming a time-driven heartbeat AND a detached park watchdog is MANDATORY before
@@ -174,7 +209,9 @@ Reached on any hard stop, unrecoverable fault, end of schedule, or user stop.
   surfaces these on the phone).
 - **Fail safe: when in doubt, stop and park.** If scope health can't be confirmed
   (`check_night_guardrails` can't read device state → treated as disconnected), the run
-  stops and parks. Never leave the mount slewed or tracking on a fault.
+  stops and parks. A guardrail call that fails outright (`ok: false`) is a stop too
+  (Phase B step 1), and a park counts only once `get_status.mount_parked` is `true`
+  (Phase C step 3). Never leave the mount slewed or tracking on a fault.
 - **This skill decides *whether to keep going and what's next*; it does not re-implement
   motion** (that is `run-session`). Planning = `observing-planner`, execution =
   `run-session`, faults = `anomaly-playbook`, QA = `qa-policy`.
@@ -193,11 +230,12 @@ Non-obvious behaviors that cost real observing time when ignored.
   first goto runs a 3-point `Initialise` alignment (takes a few minutes).
 - **Confirm framing with a real image, not telemetry.** Once per target (early), check the
   object is in frame, focused, and cloud-free — cheaply via the live plate-solve annotation
-  (`Stack.Annotate` centre `pixelx/pixely` + `radius`), or the newest sub JPG from the
-  scope's share. Frame counts don't prove the object is in frame. If it is off-centre,
-  **classify the offset** with the procedure in **`run-session`** ("Visual framing check")
-  before reacting — do not assume it is systematic, and do not burn a slot re-centring one
-  that is.
+  (`get_view_state` → `stack.target_px` + `stack.target_radius_px`), or the newest sub JPG
+  from the scope's share. Never from `plate_solve`'s `ra_deg`/`dec_deg`: they sit near the
+  commanded target, not the field centre. Frame counts don't prove the object is in frame.
+  If it is off-centre, **classify the offset** with the procedure in **`run-session`**
+  ("Visual framing check") before reacting — do not assume it is systematic, and do not
+  burn a slot re-centring one that is.
 - **High-latitude / short nights:** astronomical dark can be short, and at high latitude in
   summer there may be no true darkness before sunrise. Put **broadband** targets in the real
   dark and **LP/dual-band nebulae** into twilight — the dual-band tolerates the brightening
@@ -218,7 +256,9 @@ Non-obvious behaviors that cost real observing time when ignored.
   watch for four exit conditions: the **slot boundary**, a **drop-spike** (dropped frames
   climbing sharply across consecutive samples — a cloud bank or something drifting into the
   light path), a **link fault** (repeated solve failures or connection errors), or a
-  **guardrail stop**. Any of those warrants a decision; between them, stay quiet.
+  **guardrail stop**. Any of those warrants a decision; between them, stay quiet. The
+  shipped slot watcher (`run-session` Phase 0) does this sampling for you and prints only
+  the `DROPS`, `STALL`, `ENDED` and `ERR` lines worth a look.
 - **Keep the tool link warm.** A long slot watched by something other than MCP tools means a
   quiet connection, and quiet connections get dropped — a client polling continuously lived
   8.8 h while sessions with 40–60 min silences died repeatedly. Call a **local-only** tool
@@ -228,9 +268,12 @@ Non-obvious behaviors that cost real observing time when ignored.
 - **Check `get_run_state` after any interruption.** It answers "is a run in progress?"
   definitively rather than by inferring from a `get_view_state` timeout — `active`, `idle`, or
   `unknown` (a run was recorded but its stamp is stale, so the writer probably died). Treat
-  `unknown` as "find out", never as "the scope is free".
+  `unknown` as "find out", never as "the scope is free". The scope's own answer is
+  `get_view_state.observing`. A parked scope keeps the ended session's View, so neither
+  "a View is present" nor `result: {}` is the test.
 - **Guardrails inside the slot, not just between targets.** Re-run
   `check_night_guardrails` on a slow cadence (~10 min) *during* a slot as well as at each
   boundary. Weather, dew, and battery do not wait for a slot to end, and a 45-minute slot
   checked only at its edges is 45 minutes unguarded — which defeats the lead time the
-  predictive stops exist to give you.
+  predictive stops exist to give you. Read each in-slot result the same fail-closed way
+  as Phase B step 1.

@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import seestar_mcp.server as server_mod
 from seestar_mcp.config import Settings
 from seestar_mcp.planning.astro import Observability
@@ -237,6 +239,39 @@ def test_plan_targets_with_mocked_engine(tmp_path, monkeypatch):
     assert "observability" not in t
 
 
+def test_plan_targets_returns_dark_window_utc_and_threads_it_to_the_ranker(
+    tmp_path, monkeypatch
+):
+    # Task 7 (2026-09-22 review): plan_targets already computes the window for
+    # its weather assessment — it must surface that SAME window as a top-level
+    # field (the rule "if a tool names a quantity, return it as a field") and
+    # pass it to rank_targets instead of letting the ranker recompute it.
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
+
+    monkeypatch.setattr(server_mod, "dark_window", lambda site, when: ("a", "b"))
+    monkeypatch.setattr(server_mod, "moon_illumination", lambda when: 0.1)
+    monkeypatch.setattr(server_mod, "load_catalog", lambda: [])
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        return _canned_conditions()
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
+
+    captured = {}
+
+    def _fake_rank(*a, **k):
+        captured.update(k)
+        return [_canned_plan()]
+
+    monkeypatch.setattr(server_mod, "rank_targets", _fake_rank)
+
+    r = asyncio.run(c.plan_targets())
+    assert r["ok"] is True
+    assert r["dark_window_utc"] == ("a", "b")
+    assert captured["dark_window_utc"] == ("a", "b")
+
+
 def test_plan_targets_compact_and_project_aware(tmp_path, monkeypatch):
     c = _controller(tmp_path)
     assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
@@ -305,6 +340,37 @@ def test_unknown_target(tmp_path):
     r = asyncio.run(c.get_target_observability("NotARealObject"))
     assert r["ok"] is False
     assert "unknown target" in r["error"].lower()
+
+
+def test_get_target_observability_returns_dark_window_utc_and_threads_it(
+    tmp_path, monkeypatch
+):
+    # Task 7 (2026-09-22 review): the tool must name the night it planned as a
+    # field, and hand the window it computed straight to observability() rather
+    # than letting observability() recompute it.
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="Yard", lat=40.0, lon=-74.0, bortle=6))["ok"]
+
+    monkeypatch.setattr(server_mod, "dark_window", lambda site, when: ("a", "b"))
+
+    captured = {}
+
+    def _fake_observability(site, target, when, dark_window_utc=None):
+        captured["dark_window_utc"] = dark_window_utc
+        return Observability(
+            target_id=target.id, max_alt_deg=50.0, transit_utc="2026-07-05T04:00:00Z",
+            rise_utc=None, set_utc=None, dark_minutes_above_floor=100.0,
+            dark_minutes_in_sweet_band=80.0, field_rotation_deg_per_hr_at_transit=10.0,
+            usable_sub_minutes=40.0, transits_above_ceiling=False, moon_sep_deg=90.0,
+            moon_alt_deg=20.0, moon_illum_frac=0.1, best_window_utc=("a", "b"),
+        )
+
+    monkeypatch.setattr(server_mod, "observability", _fake_observability)
+
+    r = asyncio.run(c.get_target_observability("M27"))
+    assert r["ok"] is True
+    assert r["dark_window_utc"] == ("a", "b")
+    assert captured["dark_window_utc"] == ("a", "b")
 
 
 # --- Autonomous-night tools (simulate_night / check_night_guardrails) -------
@@ -601,7 +667,9 @@ def test_suggest_horizon_mask_no_site(tmp_path):
     assert "site" in r["error"].lower()
 
 
-def test_guardrails_read_battery_from_device_state_without_a_second_call(tmp_path):
+def test_guardrails_read_battery_from_device_state_without_a_second_call(
+    tmp_path, monkeypatch
+):
     """Battery comes from the get_device_state we already made — no pi_get_info.
 
     HARDWARE-VERIFIED (fw 7.75): battery lives at
@@ -630,9 +698,264 @@ def test_guardrails_read_battery_from_device_state_without_a_second_call(tmp_pat
         raise AssertionError(f"unexpected extra device call: {method}")
 
     c.alpaca.method_sync = _method_sync
+
+    # Stubbed explicitly (2026-09-22 review): unstubbed, this test reached the
+    # live Open-Meteo API, and would have spent meteoblue credits had
+    # SEESTAR_METEOBLUE_API_KEY been exported.
+    weather_calls = []
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        weather_calls.append(window)
+        return _canned_conditions()
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
     out = asyncio.run(c.check_night_guardrails(session_start_utc="2026-08-02T02:00:00Z"))
 
     assert out["ok"] is True
     assert calls == ["get_device_state"], (
         f"exactly one device call expected; got {calls}"
     )
+    assert len(weather_calls) == 1  # the stub, not the network, answered
+
+
+# --- date semantics: a bare date is THAT evening's night (2026-09-22 review) ---
+# `date or now` went straight into dark_window, whose nearest-night semantics
+# plan LAST night from a morning call, and "2026-09-22" parsed to 00:00Z (20:00
+# EDT on the 21st). The tools now resolve the instant via planning_when.
+
+DC_LAT, DC_LON = 38.9, -77.0
+SEP22_EVENING = ("2026-09-23T00:35", "2026-09-23T09:25")
+
+
+def _near(actual_iso: str, expected_iso: str, tol_min: float = 5.0) -> bool:
+    from datetime import datetime
+
+    a = datetime.fromisoformat(actual_iso.replace("Z", "+00:00")).replace(tzinfo=None)
+    return abs((a - datetime.fromisoformat(expected_iso)).total_seconds()) <= tol_min * 60
+
+
+def _is_sep22_evening(window) -> bool:
+    return _near(window[0], SEP22_EVENING[0]) and _near(window[1], SEP22_EVENING[1])
+
+
+def _echo_weather(monkeypatch, captured: dict | None = None):
+    """Real astronomy; the weather stub echoes the window it was asked about."""
+
+    async def _fake_assess(site, window, illum, **kwargs):
+        if captured is not None:
+            captured["window"] = window
+        a = _canned_conditions()
+        a.dark_window_utc = window
+        return a
+
+    monkeypatch.setattr(server_mod, "assess_conditions_weather", _fake_assess)
+
+
+def test_assess_conditions_bare_date_is_that_evenings_night(tmp_path, monkeypatch):
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    monkeypatch.setattr(c, "_current_gps", AsyncMock(return_value=None))
+    _echo_weather(monkeypatch)
+
+    r = asyncio.run(c.assess_conditions(date="2026-09-22"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]
+
+
+def test_plan_targets_bare_date_ranks_that_evenings_night(tmp_path, monkeypatch):
+    from seestar_mcp.planning.astro import dark_window
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    monkeypatch.setattr(c, "_current_gps", AsyncMock(return_value=None))
+    monkeypatch.setattr(server_mod, "load_catalog", lambda: [])
+    weather: dict = {}
+    _echo_weather(monkeypatch, weather)
+    ranked: dict = {}
+
+    def _fake_rank(*a, **k):
+        ranked["when"] = a[1]
+        ranked["now_utc"] = k["now_utc"]
+        return []
+
+    monkeypatch.setattr(server_mod, "rank_targets", _fake_rank)
+
+    r = asyncio.run(c.plan_targets(date="2026-09-22"))
+    assert r["ok"] is True
+    # Weather and ranking agree on the night beginning the evening of Sep 22.
+    assert _is_sep22_evening(weather["window"]), weather["window"]
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    assert _is_sep22_evening(dark_window(site, ranked["when"])), ranked["when"]
+    assert ranked["now_utc"] == ranked["when"]
+
+
+def test_get_target_observability_bare_date_is_that_evenings_night(tmp_path):
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    r = asyncio.run(c.get_target_observability("M31", date="2026-09-22"))
+    assert r["ok"] is True
+    transit = r["observability"]["transit_utc"]
+    assert SEP22_EVENING[0] <= transit[:16] <= SEP22_EVENING[1], transit
+
+
+def test_simulate_night_bare_date_schedules_that_evenings_night(tmp_path, monkeypatch):
+    from seestar_mcp.planning.astro import dark_window
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+    planned: dict = {}
+
+    async def _fake_plan_targets(date=None, types=None, limit=None):
+        planned["date"] = date
+        return {"ok": True, "conditions": None, "location": None, "targets": []}
+
+    monkeypatch.setattr(c, "plan_targets", _fake_plan_targets)
+
+    r = asyncio.run(c.simulate_night(date="2026-09-22"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]
+    # plan_targets was handed the resolved instant, so it ranks the SAME night.
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    assert dark_window(site, planned["date"]) == tuple(r["dark_window_utc"])
+
+
+# --- `now` block: live position vs floor/ceiling (live test 2026-09-24, Task 4) --
+# Every heartbeat needed a scratch astropy script to get the current target's
+# altitude/azimuth against the floor and ceiling; the tool reported the whole
+# night, not now. `now` is about the REAL current time, independent of `date`
+# (which only picks which night `observability`/`dark_window_utc` describe).
+
+
+def _freeze_now(monkeypatch, iso: str) -> None:
+    """Pin `datetime.now(timezone.utc)` to `iso` for the tool-layer clock read.
+
+    Patches `server_mod.datetime` (the module-level name `get_target_
+    observability` reads, per its own comment) rather than the stdlib
+    `datetime` module itself — astropy reads the real wall clock internally
+    (e.g. IERS polar-motion refresh) via its own `datetime` reference, and a
+    global patch broke that with a strict-type check unrelated to this test.
+    """
+    import datetime as datetime_module
+
+    frozen = datetime_module.datetime.fromisoformat(iso)
+
+    class _FrozenDatetime(datetime_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen.astimezone(tz) if tz else frozen
+
+    monkeypatch.setattr(server_mod, "datetime", _FrozenDatetime)
+
+
+def test_get_target_observability_now_matches_azalt_at_even_with_date(
+    tmp_path, monkeypatch
+):
+    """`now` reports the REAL current time even when `date` picks a different
+    night, and its alt/az match the pure `azalt_at` engine at that instant."""
+    from seestar_mcp.planning.astro import azalt_at
+    from seestar_mcp.planning.catalog import find_target
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    frozen_iso = "2026-09-23T05:00:00+00:00"
+    _freeze_now(monkeypatch, frozen_iso)
+
+    # `date` picks a DIFFERENT night (Sep 22 evening) than the frozen "now".
+    r = asyncio.run(c.get_target_observability("M31", date="2026-09-22"))
+    assert r["ok"] is True
+    assert "now" in r
+
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    expect_az, expect_alt = azalt_at(site, find_target("M31"), frozen_iso)
+
+    now = r["now"]
+    assert now["utc"] == frozen_iso
+    assert now["az_deg"] == pytest.approx(expect_az)
+    assert now["alt_deg"] == pytest.approx(expect_alt)
+
+
+def test_get_target_observability_now_booleans_flip_across_floor_and_ceiling(
+    tmp_path, monkeypatch
+):
+    """`now.above_floor`/`now.in_sweet_band` flip at the same floor/ceiling the
+    rest of the tool uses, for the same fixed alt/az."""
+    c = _controller(tmp_path)
+    monkeypatch.setattr(server_mod, "azalt_at", lambda site, target, when: (180.0, 40.0))
+
+    def _now_for(min_altitude_deg, field_rotation_ceiling_deg):
+        assert asyncio.run(
+            c.set_site_profile(
+                name="DC",
+                lat=DC_LAT,
+                lon=DC_LON,
+                min_altitude_deg=min_altitude_deg,
+                field_rotation_ceiling_deg=field_rotation_ceiling_deg,
+            )
+        )["ok"]
+        r = asyncio.run(c.get_target_observability("M31"))
+        assert r["ok"] is True
+        return r["now"]
+
+    # alt=40 is below a 50-deg floor: below the floor, so out of the band too.
+    below_floor = _now_for(50.0, 80.0)
+    assert below_floor["above_floor"] is False
+    assert below_floor["in_sweet_band"] is False
+
+    # alt=40 sits inside [20, 60]: both true.
+    in_band = _now_for(20.0, 60.0)
+    assert in_band["above_floor"] is True
+    assert in_band["in_sweet_band"] is True
+
+    # alt=40 clears a 20-deg floor but exceeds a 30-deg ceiling: up, but too
+    # high for clean alt-az subs.
+    above_ceiling = _now_for(20.0, 30.0)
+    assert above_ceiling["above_floor"] is True
+    assert above_ceiling["in_sweet_band"] is False
+
+
+def test_get_target_observability_now_honors_horizon_mask(tmp_path, monkeypatch):
+    """A masked az/alt zeroes out both booleans, exactly like the whole-night
+    `observability()` computation already does via `is_blocked`."""
+    c = _controller(tmp_path)
+    monkeypatch.setattr(server_mod, "azalt_at", lambda site, target, when: (180.0, 40.0))
+    assert asyncio.run(
+        c.set_site_profile(
+            name="DC",
+            lat=DC_LAT,
+            lon=DC_LON,
+            min_altitude_deg=20.0,
+            field_rotation_ceiling_deg=60.0,
+            horizon_mask=[[170.0, 190.0, 45.0]],
+        )
+    )["ok"]
+
+    r = asyncio.run(c.get_target_observability("M31"))
+    assert r["ok"] is True
+    now = r["now"]
+    # alt=40 clears the 20-deg global floor and sits under the 60-deg ceiling,
+    # but az=180 falls in the masked 170-190 arc below its 45-deg amin.
+    assert now["above_floor"] is False
+    assert now["in_sweet_band"] is False
+
+
+def test_get_target_observability_omitted_date_after_midnight_reports_in_progress_night(
+    tmp_path, monkeypatch
+):
+    """An omitted `date` at ~01:00 local, after local midnight but still dark,
+    reports the IN-PROGRESS night's `dark_window_utc` (dashboard session,
+    2026-09-24 review) -- the same instant pinned at the engine layer in
+    test_planning_astro.py::test_planning_when_after_local_midnight_still_in_the_dark_is_unchanged.
+    """
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    _freeze_now(monkeypatch, "2026-09-23T05:00:00+00:00")  # ~01:00 EDT
+
+    r = asyncio.run(c.get_target_observability("M31"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]

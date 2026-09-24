@@ -170,6 +170,8 @@ make lint   # or: uv run ruff check src tests
 
 Never invoke a bare `python`; always go through `uv run` so the locked environment is used.
 
+**Slot watcher:** `PYTHONIOENCODING=utf-8 uv --directory /path/to/SeeStar-AI run python -m seestar_mcp.slot_watch --duration 1740 --every 60` polls `get_view_state` and prints one line per event: stage change, drop burst, stall, session ended, error, or every 60 frames. It is the command to run under a Claude Code Monitor (`timeout_ms` 1800000; re-arm when it prints "watch window ended"), beside the session heartbeat and never instead of it. Filter it with `grep -a` because names can be non-ASCII. Full usage is in the docstring of [`src/seestar_mcp/slot_watch.py`](src/seestar_mcp/slot_watch.py).
+
 `uv sync` installs everything. For a runtime-only install use `uv sync --no-dev`.
 
 ## Configuration
@@ -261,7 +263,7 @@ their descriptions; Skills gate them behind explicit user confirmation.
 | Tool | Description |
 |---|---|
 | `connect_telescope` | Connect to the Seestar via seestar_alp. No motion; safe anytime. |
-| `get_status` | Read connection, RA/Dec pointing, and tracking/slewing state. Read-only. |
+| `get_status` | Read connection, RA/Dec pointing, and tracking/slewing state. Read-only. `tracking` is Alpaca's view and disagrees with the device; `mount_parked` / `mount_tracking` are the authoritative native fields from one `get_device_state` call (`null` if that read fails). |
 | `get_view_state` | Read the device's live view/stacking telemetry. Read-only. |
 | `get_run_state` | Read the persisted session record: `state` is tri-valued (`active` / `idle` / `unknown`, where `unknown` means a run was recorded but its stamp went stale). Survives an MCP restart, so a new session can tell whether a run is still in flight. Read-only. |
 | `goto_target` | Slew to a target and open a new session (commands MOTION). |

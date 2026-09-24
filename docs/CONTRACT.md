@@ -1,4 +1,4 @@
-# seestar-mcp consumer contract — v1.1.1
+# seestar-mcp consumer contract — v1.2.0
 
 The response shapes external consumers may rely on, and the rules for changing
 them. Enforced by `tests/test_console_contract.py`, which fails **this** repo's
@@ -11,7 +11,7 @@ it end to end.
 
 | | |
 |---|---|
-| **Version** | 1.1.1 |
+| **Version** | 1.2.0 |
 | **Covers** | 11 of 34 tools — the ones a consumer actually parses |
 | **Validated against a real consumer** | yes — the SeeStar Console parsed a real 25-sub `qa_tier2` payload with an independently written schema, first try, no changes |
 | **Enforced by** | `tests/test_console_contract.py` (21 tests, all 11 pinned at the tool boundary) |
@@ -46,9 +46,11 @@ to create state; their shapes are not pinned.
 ## Shapes that are load-bearing and easy to break by accident
 
 - **`get_view_state` must stay valid with `result: {}` and no `View` key.** That
-  is the most common real response — a connected, idle scope. Fields *on* `View`
-  are deliberately not pinned: a mid-acquisition payload carries `Initialise` and
-  `stage` but no `Stack` at all.
+  is what a freshly booted scope returns. A parked or ended session does not:
+  it keeps its View (`state` "cancel", `mode` "none"). `observing` is the
+  running test, not an empty `result`. Fields *on* `View` are deliberately not
+  pinned: a mid-acquisition payload carries `Initialise` and `stage` but no
+  `Stack` at all.
 - **Plate-solve position lives at `Stack.Annotate.result.annotations[]`**, not
   flat on `Annotate`, and `image_size` is a two-element array.
 - **`qa_tier2.summary.subs[].name` is the filename STEM** — no extension. A join
@@ -81,6 +83,94 @@ to create state; their shapes are not pinned.
 
 ## Changelog
 
+- **v1.2.0** — three additive changes; no key removed or renamed, no unit or
+  frame changed. **`get_status`** gained `mount_parked` and `mount_tracking`,
+  each `bool` or `null`, read from the device's native `get_device_state`
+  (`result.mount.close` / `result.mount.tracking`). They are the authoritative
+  park and tracking signals: the existing `tracking` is Alpaca's view, which
+  disagrees with the device on this hardware (fw 7.75 and 8.46), and is left as
+  it was. Like the other `get_status` fields, both keys are always present and
+  may be `null` (rule 1): `null` means the native read failed — unknown, never
+  `false`. That read is one more device call: `get_status` now makes six device
+  reads per call (the five Alpaca reads plus one native `get_device_state`), not
+  the single `get_device_state` the 2026-07-31 coordination note promised, and
+  the native read can wait up to `http_timeout_s` (default 30 s) on a busy
+  device; collapsing the five Alpaca reads into that one native read is planned
+  follow-up work.
+  **`plan_targets`** and **`get_target_observability`** gained a top-level
+  `dark_window_utc`, the same naive two-element pair as
+  `assess_conditions.dark_window_utc`, naming the night the result describes.
+  And **`date`** on `assess_conditions`, `plan_targets` and
+  `get_target_observability` is read differently: a bare `YYYY-MM-DD` is now the
+  site-local date of the night *beginning* that evening (it parsed to 00:00Z —
+  the evening before, in the Americas), and an omitted `date` resolves to the
+  night in progress — from astronomical dusk to astronomical dawn; the next
+  night after dawn — where a morning or midday call used to return the night
+  just ended. Pass the site's calendar date, not the UTC one. An explicit ISO
+  instant inside a night is unaffected. `dark_window_utc`'s edges carry about
+  ±5 min of jitter: they come off a 5-minute Sun-altitude grid anchored at the
+  call's own instant rather than a fixed clock tick, so the same night queried
+  a minute apart can shift the reported edges by up to one grid step.
+  *Why:* the 2026-09-22 review found no tool exposed the native mount state, so
+  nothing — the run-book skills included — could confirm a park, and a morning
+  planning call quietly described last night. `dark_window_utc` lets a caller
+  check which night it got.
+
+  **Second addition to v1.2.0 (2026-09-24 live test follow-ups), still
+  unreleased:** five more additive changes. A native reply whose JSON-RPC
+  envelope carries an explicit `code: 0` is now read as success even when its
+  `"error"` text is truthy — the dew heater's native `pi_output_set2` answers
+  every toggle with `{"error": "expected object param", "code": 0}` while it
+  DOES apply the change, confirmed by reading `get_device_state`'s
+  `heater_enable` flip. Every command tool (`goto_target`, `start_stack`,
+  `stop_view`, `run_autofocus`, `set_filter`, `set_dew_heater`, `park`,
+  `shutdown`, `plate_solve`) and the native reads `get_view_state` /
+  `get_focuser_position` now carry an additive `warning` key on success: the
+  firmware's odd text when there was one, else `None`.
+  **`plate_solve`** now polls `get_solve_result` while it answers code 215
+  ("no solve data yet"), up to ~30 s (the default `timeout_s`) — this call can
+  now take that long to return. Its success payload gains `ra_deg`, `dec_deg`,
+  `angle_deg`, `fov_deg`, `star_number`, `solve_duration_ms` and `waited_s`.
+  `ra_deg`/`dec_deg` are the solver's REPORTED position, not the field centre:
+  on fw 8.46 they sit near the commanded target even when the target is well
+  off-centre in the frame — offline image data showed the object ~23′
+  off-centre while the reported position was only ~4′ from it. For framing,
+  use `get_view_state.stack.target_px`, not these fields.
+  A solve still in progress at `timeout_s` fails (`ok: false`) with `error`,
+  `raw` (the last `get_solve_result` reply), `waited_s` (seconds spent polling)
+  and `last_code` (the last native code seen, which is always 215 on this path).
+  **`get_target_observability`** gained a `now` block (`utc`, `alt_deg`,
+  `az_deg`, `above_floor`, `in_sweet_band`): the target's position at the REAL
+  current instant, independent of `date` — `date` only selects which night
+  `dark_window_utc`/`observability` describe.
+  **`get_view_state`** gained `observing` (bool) and `stack` (dict or null).
+  `observing` is true only when `View.state == "working"` AND `View.mode !=
+  "none"` — a parked scope keeps the ended session's View (`state` "cancel",
+  `mode` "none"), so a non-empty `result` is not itself "observing". `stack`
+  is null when the reply has no View (a freshly booted scope's `result: {}`,
+  or an unreadable payload); it stays present — with its final counts — for
+  an ended session. Its keys: `target_name`, `view_state`, `mode`, `stage`,
+  `state`, `lp_filter`, `stacked`, `dropped`, `frame_errcode`, `solve_ra_deg`,
+  `solve_dec_deg`, `annotate_state`, `target_px`, `target_radius_px`.
+  `solve_ra_deg`/`solve_dec_deg` carry the same reported-position-not-
+  field-centre caveat as `plate_solve.ra_deg`/`dec_deg` above. `target_px`
+  (the Annotate pixel position for the current target) is the VERIFIED
+  framing measure — it is what the offline image-data comparison above
+  confirmed against the true off-centre object, and what `plate_solve`'s own
+  caveat points callers to instead of its `ra_deg`/`dec_deg`.
+  **`qa_tier1`**'s `snapshot` gained `target_name` (string or `null`), read from
+  `View.target_name` (or `Stack.target_name`). The trend baseline, which never
+  reset before, now resets when a new stack starts: the target name changed
+  (when both polls report one) or `stacked` decreased. So on the first poll of
+  a new stack, `trends.stacked_delta`, `trends.rejected_delta` and
+  `trends.hfd_delta` are `null` rather than a delta against the previous stack,
+  and `stacking_stalled` counts only the current stack's polls.
+  *Why:* the live test found every one of these needed a scratch script to dig
+  the same numbers out of raw native replies by hand — a false `ok: false` on
+  a heater toggle that had actually worked, a `plate_solve` that failed
+  outright on a slow solve, a `qa_tier1` poll across a target switch that
+  flagged a false `stacking_stalled`, and no field answering "is the scope
+  observing right now" or "where is the target really, this instant."
 - **v1.1.1** — `thresholds.eccentricity_marginal` is now guaranteed **finite** and
   **never above `thresholds.eccentricity_reject`**. No shape change; both were
   already true for every real session, and re-scoring the 970-sub reference night

@@ -43,6 +43,13 @@ class Tier1Snapshot:
     focus_pos: int | None = None
     hfd: float | None = None  # half-flux-diameter focus-quality (if exposed)
     tracking: bool | None = None
+    #: Reported target name (CONFIRMED on firmware 7.75: ``View.target_name``),
+    #: when the firmware exposes one. Used only so Tier1Monitor can detect a
+    #: target switch and reset its trend baseline (live test 2026-09-24: a
+    #: switch from one target to another read as stacked_delta=-274 and a
+    #: false ``stacking_stalled`` without this) -- never surfaced as a quality
+    #: signal itself.
+    target_name: str | None = None
     raw: dict = field(default_factory=dict)  # merged raw telemetry, for audit
     #: True when a telemetry read failed, so every metric above is "unknown"
     #: rather than "measured and fine". The detail lives in
@@ -212,6 +219,14 @@ def _parse_view_state(d: dict) -> dict:
     if rejected is not None:
         out["rejected"] = rejected
 
+    # Target name: CONFIRMED on firmware 7.75 at the View level, not under
+    # Stack (see REAL_VIEW_STATE in tests/test_qa_tier1.py). Tier1Monitor uses
+    # a change here to detect a target switch and reset its trend baseline --
+    # see ``Tier1Monitor._is_new_stack``.
+    target_name = _first_in((view, stack), "target_name", "target")
+    if target_name is not None:
+        out["target_name"] = target_name
+
     # Plate-solve / annotation success: on firmware 7.75 this is signalled by
     # View.Stack.Annotate.state == "complete".  Only a "complete" annotation
     # implies solve_ok=True; anything else (working/absent, e.g. Initialise)
@@ -349,6 +364,7 @@ class Tier1Monitor:
             focus_pos=dev_fields.get("focus_pos"),
             hfd=view_fields.get("hfd"),
             tracking=dev_fields.get("tracking"),
+            target_name=view_fields.get("target_name"),
             degraded=(view_err is not None or dev_err is not None),
             raw=raw,
         )
@@ -376,8 +392,56 @@ class Tier1Monitor:
 
     # --- derived signals --------------------------------------------------
 
+    @staticmethod
+    def _is_new_stack(prev: Tier1Snapshot, latest: Tier1Snapshot) -> bool:
+        """True when ``latest`` starts a new stack relative to ``prev``.
+
+        Live test 2026-09-24: consecutive polls across a ``goto_target`` gave
+        stacked 301 then 24 on the new target. The trend logic compared them
+        directly (stacked_delta=-274) and flagged a false ``stacking_stalled``
+        because it never knew the target had changed. Firmware resets the
+        live-stack counters for a new target, so a stack restarts when:
+
+        - the reported target name changes (only when the firmware actually
+          reports one for both polls -- an absent name proves nothing), or
+        - ``stacked`` decreases -- a legitimate stack only counts up, so any
+          decrease means a new one started even if no target name is exposed.
+        """
+        if (
+            prev.target_name is not None
+            and latest.target_name is not None
+            and prev.target_name != latest.target_name
+        ):
+            return True
+        if (
+            prev.stacked is not None
+            and latest.stacked is not None
+            and latest.stacked < prev.stacked
+        ):
+            return True
+        return False
+
+    def _current_stack_start(self) -> int:
+        """Index into ``history`` where the current (most recent) stack began.
+
+        Recomputed from ``history`` on every call (trends/check already do
+        this rather than caching), so it works whether ``history`` was built
+        by :meth:`poll` or assigned directly, e.g. in tests.
+        """
+        start = 0
+        for i in range(1, len(self.history)):
+            if self._is_new_stack(self.history[i - 1], self.history[i]):
+                start = i
+        return start
+
     def trends(self) -> dict:
-        """Compute inter-poll deltas. Safe with fewer than 2 snapshots."""
+        """Compute inter-poll deltas. Safe with fewer than 2 snapshots.
+
+        ``stacked_delta``/``rejected_delta``/``hfd_delta`` only ever compare
+        within the current stack (see ``_current_stack_start``) -- a poll that
+        starts a new stack reports ``None`` for these rather than a delta
+        against the previous target's counters.
+        """
         out: dict[str, Any] = {
             "stacked_delta": None,
             "rejected_delta": None,
@@ -390,9 +454,10 @@ class Tier1Monitor:
             if latest.focus_pos is not None and self.focus_baseline is not None:
                 out["focus_delta"] = latest.focus_pos - self.focus_baseline
 
-        if len(self.history) >= 2:
-            prev = self.history[-2]
-            latest = self.history[-1]
+        stack = self.history[self._current_stack_start() :]
+        if len(stack) >= 2:
+            prev = stack[-2]
+            latest = stack[-1]
             if prev.stacked is not None and latest.stacked is not None:
                 out["stacked_delta"] = latest.stacked - prev.stacked
             if prev.rejected is not None and latest.rejected is not None:
@@ -411,9 +476,13 @@ class Tier1Monitor:
         flags: list[str] = []
         trends = self.trends()
 
-        # Stacking stalled: last ``stall_polls`` snapshots show no increase.
-        if len(self.history) >= self.stall_polls:
-            window = self.history[-self.stall_polls :]
+        # Stacking stalled: last ``stall_polls`` snapshots of the CURRENT stack
+        # show no increase. Restricted to the current stack (see
+        # ``_current_stack_start``) so a target switch is never mistaken for a
+        # stall (live test 2026-09-24).
+        stack = self.history[self._current_stack_start() :]
+        if len(stack) >= self.stall_polls:
+            window = stack[-self.stall_polls :]
             stacked_vals = [snap.stacked for snap in window]
             if all(v is not None for v in stacked_vals):
                 if stacked_vals[-1] <= stacked_vals[0]:
