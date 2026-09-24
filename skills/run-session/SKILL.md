@@ -15,10 +15,17 @@ description: >
 This skill governs how to run an imaging session end to end using the `seestar-mcp`
 tools. Follow the phases in order. Do not skip pre-flight. Treat every motion command
 (goto, autofocus, park) as state-changing and confirm it succeeded before proceeding:
-`ok: true` first — every motion tool returns `ok: false` when the scope answers with a
-native error (`{"error": ..., "code": ...}`, e.g. `"method not found (code 103)"`) —
-then the command's own signal: `get_view_state` progress for a goto (Phase 1), the
-focuser position for autofocus (Phase 2), `get_status.mount_parked == true` for a park.
+`ok: true` first — every command tool returns `ok: false` when the scope's native reply
+carries `"error"` with a NONZERO (or missing) `code`, e.g. `"method not found (code 103)"`,
+or when seestar_alp hands back an `"Error: ..."` string. `"error"` text with `code: 0` is
+a success: `ok: true`, with that text in `warning` (the dew heater answers every toggle
+this way on fw 8.46 and still applies it, live test 2026-09-24). Then check the command's
+own signal: `get_view_state` progress for a goto (Phase 1), the focuser position for
+autofocus (Phase 2), `get_status.mount_parked == true` for a park. Mention a non-null
+`warning` in the status line and judge the command by that same signal, never by the
+warning text. The heater's own flag (`setting.heater_enable` in the native
+`get_device_state`) is not returned by any tool yet, so report a heater toggle as
+commanded, not confirmed.
 
 ## Operating assumptions
 - `seestar-mcp` is already registered and the Claude Code session is running on the
@@ -50,11 +57,13 @@ rate, goal progress, and whether a planned target switch is due.
   but `in_sweet_band` false = above the ceiling). Not its `observability` block,
   which is the whole night's plan. Local-only, so it costs the device nothing. An
   off-catalog target returns `ok: false`; watch its planned window instead.
-- **Tracking, at least once per target while it stacks:** `get_status`, and
-  check `mount_tracking` is `true` (the device's native flag, not Alpaca's
-  `tracking`). `false` mid-stack → the anomaly-playbook branch "`mount_tracking`
-  false while stacking". `null` means the read failed; re-read on the next wake.
-  `get_status` costs six device reads, so once per target is enough.
+- **Tracking, once per target while it stacks:** record
+  `get_status.mount_tracking` (the device's native flag, not Alpaca's
+  `tracking`). Not yet verified mid-stack on fw 8.46, so do not expect it to
+  read `true`. Act on it only through the anomaly-playbook branch
+  "`mount_tracking` false while stacking". `null` means the read failed; re-read
+  on the next wake. `get_status` costs six device reads, so once per target is
+  enough.
 
 **2. A DETACHED park watchdog.** A plain script — no MCP, no agent — that talks
 to `seestar_alp` over HTTP, and at a fixed dawn deadline stops the view and
@@ -104,7 +113,8 @@ PYTHONIOENCODING=utf-8 uv --directory <repo> run python -m seestar_mcp.slot_watc
 ```
 
 It reads only `get_view_state`, once a minute, and prints one line per event:
-a stage or target change, `DROPS +K`, `milestone`, `STALL`, `ENDED` (the
+a stage or target change, `new stack on <target>` (`stacked` fell on the same
+target, e.g. a re-acquire), `DROPS +K`, `milestone`, `STALL`, `ENDED` (the
 session's `observing` turned false; carries the final counts and `errcode`) and
 `ERR`. Nothing prints while all is well. A Monitor kills its command after at
 most 30 min, so the window is 29 min: `watch window ended (re-arm to keep
@@ -138,7 +148,8 @@ something outside the agent will run it.
    Never report "the telescope is offline" when it is actually the bridge that is down.
 2. `get_view_state` — confirm no session is already in progress: read `observing`,
    which is `true` only while a session is actually running. A parked or stopped scope
-   keeps the ended session's View (`view_state` "cancel", `mode` "none"), and
+   keeps the ended session's View (`stack.view_state` "cancel", `stack.mode` "none"; the
+   top-level `view_state` is the raw native payload), and
    `result: {}` is only what a freshly booted scope returns. So neither "a View is
    present" nor `result: {}` is the test. If `observing` is `true`, ask the user
    whether to stop it (`stop_view`) before starting a new target.
@@ -202,7 +213,11 @@ something outside the agent will run it.
    - **Dropped to `ContinuousExposure` with pointing unchanged from before the goto** → the
      mount never slewed (parked, or bad coordinates). Recover via anomaly-playbook; do NOT
      start stacking on a phantom goto.
-5. Once stacking has begun, confirm the solve (`plate_solve` or the stack's Annotate state).
+5. Once stacking has begun, confirm the solve. Prefer `get_view_state` →
+   `stack.annotate_state` (`"complete"` once the live stack has solved and annotated the
+   field): one device read. `plate_solve` also works, but it polls the device for up to
+   ~30 s (`start_solve` plus up to 16 `get_solve_result` reads) and can take that long to
+   return.
    If the solve fails, do not rely on the stack — hand off to the anomaly-playbook skill
    (pointing/transparency branch).
 
@@ -246,7 +261,8 @@ diagnosing inline:
 - Focus drifting from baseline → temperature change; consider a mid-session refocus.
 - Plate-solve dropping out → pointing / transparency.
 - `get_status.mount_tracking` `false` while stacking (the heartbeat's once-per-target
-  check, Phase 0) → tracking; anomaly-playbook "`mount_tracking` false while stacking".
+  check, Phase 0) → anomaly-playbook "`mount_tracking` false while stacking". Not yet
+  verified mid-stack on fw 8.46; that branch re-slews only when the stack is also flat.
 - Drops holding above ~40% past the first ~5 min while the solve stays on target, with the
   LP filter in (`get_view_state.stack.frame_errcode` often 530, usually a bright moon up)
   → anomaly-playbook "sustained drops with the LP filter".

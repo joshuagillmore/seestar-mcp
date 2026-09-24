@@ -48,14 +48,20 @@ silently stopped.
 
 ## Symptom: `mount_tracking` false while stacking
 Trigger: the run-session heartbeat's once-per-target `get_status` reads `mount_tracking:
-false` while `get_view_state.observing` is `true`. **Not yet confirmed on hardware:** the
-live test of 2026-09-24 never read `get_status` mid-stack, so nobody has seen what a
-healthy stack reports here. Corroborate before re-slewing.
-- **Stack still climbing** (`get_view_state.stack.stacked` rising, drops not spiking) →
-  frames are landing, so the mount is following the sky. Do NOT re-slew on the flag alone.
-  Tell the user in one line (it is new evidence about this firmware) and keep imaging.
-- **Stack flat, or drops climbing** → treat it as tracking lost: the tracking case of
-  "stacking count flat" above (re-issue goto + plate_solve, one retry, surface).
+false` while `get_view_state.observing` is `true`. **`mount_tracking` has not yet been
+observed mid-stack on fw 8.46.** The only captured mount block (`tracking: false`) was read
+with the arm up before the night's first goto, with no session running, so nobody has
+seen what a healthy stack reports here. Corroborate before re-slewing.
+- **`stacked` still climbing** (`get_view_state.stack.stacked` rising) → frames are
+  landing, so the mount is following the sky. A `false` here may simply be how this
+  firmware reports it: record it (one line in the status, e.g. `M57: mount_tracking
+  false while stacked climbs — noted, no action.`) and take no action. Do NOT re-slew.
+- **Drops climbing while `stacked` still climbs** → not a tracking symptom. Use the
+  "sustained drops with the LP filter", "incoming clouds" and "rejection rate spiking"
+  branches.
+- **Stack flat, star count fine** → the ONLY case that re-slews: treat it as tracking
+  lost, the tracking case of "stacking count flat" above (re-issue goto + plate_solve, one
+  retry, surface). Stack flat with the star count collapsed is clouds, not tracking.
 - **`null`** → the native read failed and proves nothing. Re-read on the next wake.
 
 ## Symptom: rejection rate spiking
