@@ -275,7 +275,7 @@ class SeestarController:
             state = await self.alpaca.method_sync("get_view_state")
             if (bad := _native_fail(state)) is not None:
                 return bad
-            return {"ok": True, "view_state": state}
+            return {"ok": True, "view_state": state, "warning": _native_warning(state)}
         except AlpacaError as exc:
             return _err(exc)
 
@@ -362,6 +362,7 @@ class SeestarController:
                 "dec": dec,
                 "lp_filter": bool(use_lp_filter),
                 "result": result,
+                "warning": _native_warning(result),
             }
         except AlpacaError as exc:
             return _err(exc)
@@ -373,7 +374,7 @@ class SeestarController:
             result = await self.alpaca.method_sync("iscope_start_stack")
             if (bad := _native_fail(result)) is not None:
                 return bad
-            return {"ok": True, "result": result}
+            return {"ok": True, "result": result, "warning": _native_warning(result)}
         except AlpacaError as exc:
             return _err(exc)
 
@@ -384,7 +385,12 @@ class SeestarController:
             result = await self.alpaca.method_sync("iscope_stop_view", [mode])
             if (bad := _native_fail(result, mode=mode)) is not None:
                 return bad
-            return {"ok": True, "mode": mode, "result": result}
+            return {
+                "ok": True,
+                "mode": mode,
+                "result": result,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -405,7 +411,12 @@ class SeestarController:
             except AlpacaError:
                 # Best-effort baseline only; do not fail autofocus on this.
                 focus_pos = None
-            return {"ok": True, "result": result, "focus_pos": focus_pos}
+            return {
+                "ok": True,
+                "result": result,
+                "focus_pos": focus_pos,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -418,7 +429,12 @@ class SeestarController:
             )
             if (bad := _native_fail(focus)) is not None:
                 return bad
-            return {"ok": True, "focuser": focus, "focus_pos": _extract_focus_pos(focus)}
+            return {
+                "ok": True,
+                "focuser": focus,
+                "focus_pos": _extract_focus_pos(focus),
+                "warning": _native_warning(focus),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -439,7 +455,11 @@ class SeestarController:
             result = await self.alpaca.method_sync("get_solve_result")
             if (bad := _native_fail(result)) is not None:
                 return bad
-            return {"ok": True, "solve_result": result}
+            return {
+                "ok": True,
+                "solve_result": result,
+                "warning": _native_warning(started) or _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -467,7 +487,12 @@ class SeestarController:
             result = await self.alpaca.method_sync("set_wheel_position", [position])
             if (bad := _native_fail(result, position=position)) is not None:
                 return bad
-            return {"ok": True, "position": position, "result": result}
+            return {
+                "ok": True,
+                "position": position,
+                "result": result,
+                "warning": _native_warning(result),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -494,6 +519,7 @@ class SeestarController:
                 "ok": True,
                 "heater": bool(on),
                 "result": result,
+                "warning": _native_warning(result),
                 "note": (
                     "Enabling the dew heater changes sensor temperature and "
                     "invalidates existing dark frames; rebuild darks afterwards."
@@ -513,7 +539,7 @@ class SeestarController:
             # it would report a run in progress against a parked mount.
             clear_run_state(self._run_state_path())
             self._run_start_utc = None
-            return {"ok": True, "result": result}
+            return {"ok": True, "result": result, "warning": _native_warning(result)}
         except AlpacaError as exc:
             return _err(exc)
 
@@ -530,6 +556,7 @@ class SeestarController:
             return {
                 "ok": True,
                 "result": result,
+                "warning": _native_warning(result),
                 "note": (
                     "Seestar shutdown issued; this ends the seestar_alp control "
                     "link until the device is powered back on."
@@ -1578,6 +1605,30 @@ def _err(exc: AlpacaError) -> dict:
     }
 
 
+def _native_error_parts(value: dict) -> tuple[str, Any] | None:
+    """Return ``(text, code)`` for a dict's truthy ``"error"`` key, else ``None``.
+
+    Shared by :func:`_native_error` and :func:`_native_warning` so the two never
+    disagree on which code wins: a nested JSON-RPC error object's own ``"code"``
+    overrides the envelope's top-level one.
+    """
+    err = value.get("error")
+    if not err:
+        return None
+    code = value.get("code")
+    if isinstance(err, dict):
+        code = err.get("code", code)
+        text = str(err.get("message") or err)
+    else:
+        text = str(err)
+    return text, code
+
+
+def _is_native_success_code(code: Any) -> bool:
+    """``True`` only for an explicit integer ``0`` — never a missing code."""
+    return code == 0 and not isinstance(code, bool)
+
+
 def _native_error(value: Any) -> str | None:
     """Return an error string if a native action result signals failure, else None.
 
@@ -1597,6 +1648,18 @@ def _native_error(value: Any) -> str | None:
     ``"error"`` is now an error, reported as ``"<text> (code <n>)"``. A normal
     reply carries ``"code": 0`` and no ``"error"``, so it is not affected. A
     standard JSON-RPC 2.0 error object (``{"message", "code"}``) is read too.
+
+    HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): the dew heater's native
+    ``pi_output_set2`` answered every call with ``{"jsonrpc": "2.0", "Timestamp":
+    "663.578618899", "method": "pi_output_set2", "error": "expected object
+    param", "code": 0, "result": 0, "id": 10104}`` while it DID apply the
+    change — confirmed by switching the heater off/on and reading
+    ``get_device_state``'s ``result.setting.heater_enable`` flip each time. A
+    truthy ``"error"`` is now a failure ONLY when ``code`` is present and
+    nonzero, or absent; an explicit ``code == 0`` is success regardless of the
+    ``"error"`` text, so a missing code is never read as proof of success. The
+    firmware's odd text on a ``code == 0`` reply is recovered separately by
+    :func:`_native_warning`, so it is not silently dropped.
     """
     if isinstance(value, str) and value.strip().lower().startswith("error"):
         return value
@@ -1604,15 +1667,31 @@ def _native_error(value: Any) -> str | None:
         result = value.get("result")
         if isinstance(result, str) and result.strip().lower().startswith("error"):
             return result
-        err = value.get("error")
-        if err:
-            code = value.get("code")
-            if isinstance(err, dict):
-                code = err.get("code", code)
-                text = str(err.get("message") or err)
-            else:
-                text = str(err)
-            return f"{text} (code {code})" if code is not None else text
+        parsed = _native_error_parts(value)
+        if parsed is not None:
+            text, code = parsed
+            if not _is_native_success_code(code):
+                return f"{text} (code {code})" if code is not None else text
+    return None
+
+
+def _native_warning(value: Any) -> str | None:
+    """Recover the firmware's own text from an otherwise-successful native reply.
+
+    A native reply can carry a truthy ``"error"`` string alongside an explicit
+    ``code == 0`` — :func:`_native_error` treats that as success (see its
+    docstring, live test 2026-09-24), but the odd text is still worth surfacing
+    rather than discarding. Callers merge this into their success dict as an
+    additive ``warning`` field. Returns ``None`` when there is nothing to warn
+    about — no ``"error"`` text, or a genuine failure (handled instead by
+    :func:`_native_error`/:func:`_native_fail`).
+    """
+    if isinstance(value, dict):
+        parsed = _native_error_parts(value)
+        if parsed is not None:
+            text, code = parsed
+            if _is_native_success_code(code):
+                return text
     return None
 
 

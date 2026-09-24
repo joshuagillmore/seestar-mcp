@@ -735,6 +735,74 @@ def test_native_error_formats_text_and_code():
     assert _native_error({"result": {"step": 1}}) is None
 
 
+# --- code 0 with a truthy "error" text is SUCCESS (live test 2026-09-24) -----
+# The dew heater's native pi_output_set2 answered every toggle with a truthy
+# "error" string AND code 0, while it DID apply the change -- verified live by
+# switching the heater off/on and reading get_device_state's
+# result.setting.heater_enable flip each time. _native_error treated any
+# truthy "error" as failure regardless of code, so set_dew_heater reported a
+# false ok:false on a command that had actually worked. Real failures carry a
+# nonzero code ("method not found" is 103, "no solve data" is 215, "fail to
+# operate" is 207); a MISSING code is not proof of success either -- only an
+# explicit code 0 is.
+
+#: Captured verbatim, live test 2026-09-24.
+NATIVE_WARNING_REPLY = {
+    "jsonrpc": "2.0",
+    "Timestamp": "663.578618899",
+    "method": "pi_output_set2",
+    "error": "expected object param",
+    "code": 0,
+    "result": 0,
+    "id": 10104,
+}
+
+
+def test_native_error_code_zero_with_error_text_is_success():
+    from seestar_mcp.server import _native_error
+
+    assert _native_error(NATIVE_WARNING_REPLY) is None
+
+
+async def test_set_dew_heater_code_zero_error_text_is_ok_with_warning(tmp_path):
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_WARNING_REPLY))
+    result = await ctrl.set_dew_heater(True)
+    assert result["ok"] is True
+    assert "expected object param" in result["warning"]
+
+
+@pytest.mark.parametrize("name", sorted(_NATIVE_GUARDED))
+async def test_native_success_with_warning_text_carries_it_on_every_guarded_method(
+    tmp_path, name
+):
+    # "Every controller method that uses _native_fail should carry `warning`
+    # when present" -- not just set_dew_heater.
+    ctrl = _native_ctl(tmp_path, dict(NATIVE_WARNING_REPLY))
+    result = await _NATIVE_GUARDED[name](ctrl)
+    assert result["ok"] is True, f"{name} failed a code-0 reply with error text: {result}"
+    assert result.get("warning") == "expected object param", (
+        f"{name} dropped the firmware's warning text: {result}"
+    )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [103, 207, 215],
+    ids=["method_not_found", "fail_to_operate", "no_solve_data"],
+)
+def test_native_error_nonzero_codes_still_fail(code):
+    from seestar_mcp.server import _native_error
+
+    assert _native_error({"error": "x", "code": code}) is not None
+
+
+def test_native_error_missing_code_is_not_proof_of_success():
+    # A missing "code" key must NOT be read as success -- only an explicit 0 is.
+    from seestar_mcp.server import _native_error
+
+    assert _native_error({"error": "heater fault", "result": 0}) == "heater fault"
+
+
 async def test_park_rejected_by_device_keeps_the_run_state(tmp_path):
     from seestar_mcp.run_state import RunState, read_run_state, write_run_state
 
@@ -881,6 +949,12 @@ async def test_plate_solve_accepted_start_returns_the_solve(tmp_path):
 #: A fw 8.46-shaped get_device_state reply: the JSON-RPC envelope, the validated
 #: paths (device.is_verified, location_lon_lat, pi_status.battery_capacity) and
 #: the mount block with close/tracking. Other device keys trimmed.
+#:
+#: The mount block itself is captured verbatim (live test 2026-09-24), PARKED:
+#: {"move_type": "none", "close": True, "tracking": False, "equ_mode": False}
+#: -- replacing an earlier, merely-documented shape that happened to omit
+#: equ_mode. `close` became True after park; while imaging it read False (see
+#: DEVICE_STATE_846_IMAGING below) -- both captured on the same run.
 DEVICE_STATE_846 = {
     "jsonrpc": "2.0",
     "Timestamp": "412.118804211",
@@ -890,19 +964,41 @@ DEVICE_STATE_846 = {
         "setting": {"lang": "en"},
         "location_lon_lat": [-75.7, 45.4],
         "pi_status": {"battery_capacity": 87},
-        "mount": {"move_type": "none", "close": True, "tracking": False},
+        "mount": {
+            "move_type": "none",
+            "close": True,
+            "tracking": False,
+            "equ_mode": False,
+        },
     },
     "code": 0,
     "id": 90311,
+}
+
+#: Same capture, mid-session while imaging: the arm is unfolded (`close`
+#: False). `tracking` still reads False from the device even while actively
+#: on-target -- Alpaca's own `/tracking` disagrees with this on the same
+#: hardware (see CLAUDE.md), which is exactly why get_status treats this
+#: native field, not Alpaca's, as authoritative.
+DEVICE_STATE_846_IMAGING = {
+    **DEVICE_STATE_846,
+    "result": {
+        **DEVICE_STATE_846["result"],
+        "mount": {
+            "move_type": "none",
+            "close": False,
+            "tracking": False,
+            "equ_mode": False,
+        },
+    },
 }
 
 
 def test_parse_mount_state_reads_the_fw846_nested_shape():
     from seestar_mcp.server import _parse_mount_state
 
-    assert _parse_mount_state(DEVICE_STATE_846) == (True, False)
-    unfolded = {"result": {"mount": {"close": False, "tracking": True}}}
-    assert _parse_mount_state(unfolded) == (False, True)
+    assert _parse_mount_state(DEVICE_STATE_846) == (True, False)  # parked
+    assert _parse_mount_state(DEVICE_STATE_846_IMAGING) == (False, False)  # imaging
     # Flat mount dict for simple mocks.
     assert _parse_mount_state({"mount": {"close": True, "tracking": True}}) == (
         True,
@@ -975,6 +1071,16 @@ async def test_get_status_carries_the_native_mount_state(tmp_path):
     assert out["mount_tracking"] is False
     assert ctrl.alpaca.method_sync.await_count == 1
     assert ctrl.alpaca.method_sync.await_args.args == ("get_device_state",)
+
+
+async def test_get_status_carries_the_native_mount_state_while_imaging(tmp_path):
+    # Captured live 2026-09-24: mid-session the mount reports close:False
+    # (arm unfolded) and tracking:False (Alpaca disagrees; see CLAUDE.md).
+    ctrl = _status_ctl(tmp_path, device_reply=DEVICE_STATE_846_IMAGING)
+    out = await ctrl.get_status()
+    assert {k: out[k] for k in _ALPACA_STATUS} == _ALPACA_STATUS
+    assert out["mount_parked"] is False
+    assert out["mount_tracking"] is False
 
 
 @pytest.mark.parametrize(
