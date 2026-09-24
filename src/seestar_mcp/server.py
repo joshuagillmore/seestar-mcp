@@ -26,6 +26,7 @@ signature; credentials live only in :mod:`seestar_mcp.secrets`.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import dataclasses
 import json
@@ -438,8 +439,33 @@ class SeestarController:
         except AlpacaError as exc:
             return _err(exc)
 
-    async def plate_solve(self) -> dict:
-        """Plate-solve the current field: start a solve, then read the result."""
+    async def plate_solve(
+        self, *, poll_interval_s: float = 2.0, timeout_s: float = 30.0
+    ) -> dict:
+        """Plate-solve the current field: start a solve, then poll for the result.
+
+        HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): calling
+        ``get_solve_result`` immediately after ``start_solve`` got
+        ``{"error": "no solve data", "code": 215}`` — the solve had not
+        finished yet — and this used to return a false ``ok: false`` on a
+        solve that was still running. Poll ``get_solve_result`` instead, every
+        ``poll_interval_s`` (default ~2s) up to ``timeout_s`` (default ~30s);
+        this call can take that long to return. Code 215 means "in progress"
+        ONLY inside this polling loop — everywhere else a native 215 is an
+        ordinary error, like any other nonzero code.
+
+        On success the additive fields ``ra_deg``/``dec_deg``/``angle_deg``/
+        ``fov_deg``/``star_number``/``solve_duration_ms`` sit next to the
+        unchanged ``solve_result``, plus ``waited_s`` (how long this call
+        actually spent polling). ``ra_deg``/``dec_deg``/``angle_deg`` are the
+        *solver's reported position* (RA converted from hours to degrees), not
+        the field centre: on fw 8.46 this reported position sits near the
+        commanded target even when the object is well off-centre in the frame
+        — M1's nebula sat ~23' off-centre in the averaged raw subs (matching
+        the live-stack Annotate position) while the solved ``ra_dec`` sat only
+        ~4' from the M1 catalog position. For framing, use the stack Annotate
+        pixel position (``get_view_state``), not these fields.
+        """
         try:
             # FIRMWARE-DEPENDENT: solve method names.
             started = await self.alpaca.method_sync("start_solve")
@@ -452,13 +478,36 @@ class SeestarController:
             # which every other command already treats as "did not start".
             if (bad := _native_fail(started)) is not None:
                 return bad
-            result = await self.alpaca.method_sync("get_solve_result")
+
+            waited_s = 0.0
+            result: Any = None
+            while True:
+                result = await self.alpaca.method_sync("get_solve_result")
+                code = _native_solve_code(result)
+                if code != _SOLVE_IN_PROGRESS_CODE:
+                    break
+                if waited_s >= timeout_s:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"plate_solve timed out after {timeout_s:.1f}s "
+                            f"waiting for the solve (last code {code})"
+                        ),
+                        "raw": result,
+                        "waited_s": waited_s,
+                        "last_code": code,
+                    }
+                await asyncio.sleep(poll_interval_s)
+                waited_s += poll_interval_s
+
             if (bad := _native_fail(result)) is not None:
                 return bad
             return {
                 "ok": True,
                 "solve_result": result,
                 "warning": _native_warning(started) or _native_warning(result),
+                "waited_s": waited_s,
+                **_extract_solve_fields(result),
             }
         except AlpacaError as exc:
             return _err(exc)
@@ -1695,6 +1744,73 @@ def _native_warning(value: Any) -> str | None:
     return None
 
 
+#: get_solve_result's native code for "the solve has not finished yet"
+#: (HARDWARE-OBSERVED, fw 8.46, live test 2026-09-24: ``{"error": "no solve
+#: data", "code": 215}`` right after start_solve). Meaningful ONLY inside
+#: :meth:`SeestarController.plate_solve`'s polling loop — everywhere else a
+#: native 215 is an ordinary error, like any other nonzero code.
+_SOLVE_IN_PROGRESS_CODE = 215
+
+
+def _native_solve_code(value: Any) -> Any:
+    """Return a native error dict's ``code``, else ``None``.
+
+    Used only by :meth:`SeestarController.plate_solve` to recognise
+    ``_SOLVE_IN_PROGRESS_CODE`` while polling; a normal success reply (no
+    truthy ``"error"``) yields ``None``, which never equals 215.
+    """
+    if isinstance(value, dict):
+        parsed = _native_error_parts(value)
+        if parsed is not None:
+            return parsed[1]
+    return None
+
+
+def _extract_solve_fields(value: Any) -> dict:
+    """Best-effort ra_deg/dec_deg/angle_deg/fov_deg/star_number/solve_duration_ms.
+
+    Pulled from ``get_solve_result``'s nested ``result`` object (RA converted
+    from hours to degrees). Never raises: any missing or malformed key yields
+    ``None`` for that field rather than a crash, mirroring
+    :func:`_extract_focus_pos`.
+
+    These are the *solver's reported position*, not the field centre.
+    HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): this reported position
+    sits near the commanded target even when the object is well off-centre in
+    the frame — M1's nebula sat ~23' off-centre in the averaged raw subs
+    (matching the live-stack Annotate position) while the solved ``ra_dec``
+    sat only ~4' from the M1 catalog position, and the FITS header RA/DEC
+    ~1'. For framing, use the stack Annotate pixel position
+    (``get_view_state``), not these fields.
+    """
+    fields: dict[str, Any] = {
+        "ra_deg": None,
+        "dec_deg": None,
+        "angle_deg": None,
+        "fov_deg": None,
+        "star_number": None,
+        "solve_duration_ms": None,
+    }
+    nested = value.get("result") if isinstance(value, dict) else None
+    if not isinstance(nested, dict):
+        return fields
+    ra_dec = nested.get("ra_dec")
+    if (
+        isinstance(ra_dec, (list, tuple))
+        and len(ra_dec) == 2
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in ra_dec)
+    ):
+        fields["ra_deg"] = ra_dec[0] * 15
+        fields["dec_deg"] = ra_dec[1]
+    fields["angle_deg"] = nested.get("angle")
+    fov = nested.get("fov")
+    if isinstance(fov, (list, tuple)) and len(fov) == 2:
+        fields["fov_deg"] = list(fov)
+    fields["star_number"] = nested.get("star_number")
+    fields["solve_duration_ms"] = nested.get("duration_ms")
+    return fields
+
+
 def _native_fail(value: Any, **extra: Any) -> dict | None:
     """Return an ``ok:false`` envelope if ``value`` is a native error, else None.
 
@@ -2002,7 +2118,14 @@ async def get_focuser_position() -> dict:
 
 @mcp.tool()
 async def plate_solve() -> dict:
-    """Plate-solve the current field and return the solution. Read-only pointing."""
+    """Plate-solve the current field and return the solution. Read-only pointing.
+
+    Polls the device while the solve is in progress, up to ~30s, so this call
+    can take that long to return. ``ra_deg``/``dec_deg`` report the solver's
+    RA (converted from hours to degrees) and Dec — the solver's reported
+    position, not necessarily the true field centre (fw 8.46 caveat: see
+    SeestarController.plate_solve).
+    """
     return await get_controller().plate_solve()
 
 

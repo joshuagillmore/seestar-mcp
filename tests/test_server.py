@@ -941,6 +941,162 @@ async def test_plate_solve_accepted_start_returns_the_solve(tmp_path):
     assert methods == ["start_solve", "get_solve_result"]
 
 
+# --- plate_solve polls through "no solve data" (task 2, live test 2026-09-24) -
+# plate_solve called get_solve_result immediately after start_solve. On fw 8.46
+# the device answered {"error": "no solve data", "code": 215} because the solve
+# had not finished, and plate_solve returned a false ok:false on a solve that
+# was still running. Poll instead, and only inside this loop does code 215 mean
+# "in progress" rather than an error.
+
+#: Captured verbatim (live test 2026-09-24): the "still solving" reply.
+_SOLVE_215_REPLY = {
+    "jsonrpc": "2.0",
+    "Timestamp": "10925.804433318",
+    "method": "get_solve_result",
+    "error": "no solve data",
+    "code": 215,
+    "id": 13769,
+}
+
+#: Captured ra_dec/fov/angle values are M1's solved position (live test
+#: 2026-09-24), not the observing site, so they are fine to commit. focal_len
+#: matches the pre-existing _SOLVE_REPLY fixture above (same telescope).
+#: image_id/state/star_number/duration_ms are synthetic -- only the keys, not
+#: their values, were captured live.
+_SOLVED_846_REPLY = {
+    "jsonrpc": "2.0",
+    "Timestamp": "10931.221",
+    "method": "get_solve_result",
+    "result": {
+        "ra_dec": [5.572092, 22.068264],
+        "fov": [0.712755, 1.269035],
+        "focal_len": 250,
+        "angle": 48.994995,
+        "image_id": 7,
+        "state": 1,
+        "star_number": 143,
+        "duration_ms": 812,
+    },
+    "code": 0,
+    "id": 13770,
+}
+
+_ACCEPTED_START_SOLVE = {
+    "jsonrpc": "2.0",
+    "method": "start_solve",
+    "result": 0,
+    "code": 0,
+}
+
+
+def _polling_solve_ctl(tmp_path, start_reply, solve_replies):
+    """Like _solve_ctl, but get_solve_result answers a scripted sequence."""
+    ctrl = _native_ctl(tmp_path, None)
+    remaining = list(solve_replies)
+
+    def side_effect(method, *_args, **_kwargs):
+        if method == "start_solve":
+            return start_reply
+        assert method == "get_solve_result"
+        return remaining.pop(0)
+
+    ctrl.alpaca.method_sync.side_effect = side_effect
+    return ctrl
+
+
+def _mock_sleep(monkeypatch):
+    """Replace asyncio.sleep with a recorder so polling tests never really sleep."""
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(server_mod.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+async def test_plate_solve_polls_past_code_215_then_returns_the_solved_result(
+    tmp_path, monkeypatch
+):
+    ctrl = _polling_solve_ctl(
+        tmp_path,
+        _ACCEPTED_START_SOLVE,
+        [
+            dict(_SOLVE_215_REPLY),
+            dict(_SOLVE_215_REPLY),
+            dict(_SOLVE_215_REPLY),
+            dict(_SOLVED_846_REPLY),
+        ],
+    )
+    slept = _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve()
+
+    assert result["ok"] is True
+    assert result["solve_result"] == _SOLVED_846_REPLY
+    assert result["ra_deg"] == pytest.approx(5.572092 * 15)
+    assert result["dec_deg"] == pytest.approx(22.068264)
+    assert result["angle_deg"] == pytest.approx(48.994995)
+    assert result["fov_deg"] == [0.712755, 1.269035]
+    assert result["star_number"] == 143
+    assert result["solve_duration_ms"] == 812
+    assert result["waited_s"] == pytest.approx(6.0)
+    assert slept == [2.0, 2.0, 2.0], "default poll interval is ~2s"
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve"] + ["get_solve_result"] * 4
+
+
+async def test_plate_solve_gives_up_after_code_215_past_the_timeout(
+    tmp_path, monkeypatch
+):
+    ctrl = _polling_solve_ctl(
+        tmp_path,
+        _ACCEPTED_START_SOLVE,
+        [dict(_SOLVE_215_REPLY) for _ in range(10)],  # more than the timeout needs
+    )
+    slept = _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve(poll_interval_s=1.0, timeout_s=3.0)
+
+    assert result["ok"] is False
+    assert "timeout" in result["error"].lower() or "timed out" in result["error"].lower()
+    assert "215" in result["error"], "the last native code must reach the caller"
+    assert "3.0" in result["error"], "the timeout itself must reach the caller"
+    assert result["waited_s"] == pytest.approx(3.0)
+    assert result["last_code"] == 215
+    assert "solve_result" not in result
+    assert slept == [1.0, 1.0, 1.0]
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve"] + ["get_solve_result"] * 4
+
+
+async def test_plate_solve_fails_immediately_on_a_non_215_get_solve_result_error(
+    tmp_path, monkeypatch
+):
+    # A non-215 native error (e.g. 207) is a real failure, not "still solving" --
+    # fail immediately, with no further polling.
+    ctrl = _polling_solve_ctl(
+        tmp_path, _ACCEPTED_START_SOLVE, [{"error": "fail to operate", "code": 207}]
+    )
+    slept = _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve()
+
+    assert result["ok"] is False
+    assert "207" in result["error"]
+    assert "solve_result" not in result
+    assert slept == [], "a non-215 error must not trigger a poll wait"
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve", "get_solve_result"]
+
+
+async def test_plate_solve_tool_description_states_wait_and_degrees():
+    tools = {t.name: t for t in await mcp.list_tools()}
+    desc = tools["plate_solve"].description or ""
+    assert "30" in desc, "must state the call may take up to ~30s"
+    assert "degrees" in desc.lower(), "must state RA is returned in degrees"
+
+
 # --- get_status carries the authoritative native mount state -----------------
 # Alpaca /tracking and /atpark disagree with the device on fw 7.75 and 8.46;
 # get_device_state's mount.close (True = arm folded) is the authoritative park
