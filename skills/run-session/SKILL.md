@@ -368,6 +368,13 @@ frame-left offset, which persisted through a power-cycle, re-level, and fresh da
 alignment, was J2000-vs-JNow precession, not hardware. Averaged raw subs did confirm
 Annotate's position for M1 on 2026-09-24, so `stack.target_px` stays the framing measure.)
 
+**First-night stop rule.** On the first framing check of the first night after this fix,
+compare the offset (`get_view_state` → `stack.target_px` vs frame centre (540, 960), ~2.4″/px)
+against the pre-fix baseline above. If it is clearly larger — roughly double, e.g. ~45′ on
+M1, or the target missing from the frame entirely — stop re-acquiring and report to the user
+instead: a wrong precession direction doubles the offset rather than removing it. If the
+offset is a few arcminutes, that is the expected residual — record it and carry on.
+
 For faint nebulae a single 10 s sub barely shows the object — that is normal; the
 accumulated stack reveals it. The check here is framing/focus/clouds, not depth.
 

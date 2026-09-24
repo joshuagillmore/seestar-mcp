@@ -16,6 +16,8 @@ Fill in only what you have actually measured. "Unknown" is a valid, honest answe
   survives a power-cycle + re-level + fresh dark alignment). Note how you measured it,
   e.g. "annotated centre ~170/1080 px vs frame centre 540 — measured on 3 targets at
   different sky angles".
+  Any offset recorded before contract v1.3.0 (2026-09-24) includes J2000-vs-JNow
+  precession of up to ~22′ on top of the real mechanical error — re-measure after the fix.
 - **Focuser baseline:** typical position after the acquisition autofocus, if you track it.
 
 ## Site

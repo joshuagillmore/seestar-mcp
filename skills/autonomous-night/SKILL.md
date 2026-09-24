@@ -237,7 +237,10 @@ Non-obvious behaviors that cost real observing time when ignored.
   precession). Frame counts don't prove the object is in frame.
   If it is off-centre, **classify the offset** with the procedure in **`run-session`**
   ("Visual framing check") before reacting — do not assume it is systematic, and do not
-  burn a slot re-centring one that is.
+  burn a slot re-centring one that is. **First night after this fix:** if the offset is
+  clearly larger than the pre-fix baseline (roughly double, or the target missing from
+  frame) rather than a residual few arcminutes, stop and report to the user — see the
+  stop rule in `run-session`.
 - **High-latitude / short nights:** astronomical dark can be short, and at high latitude in
   summer there may be no true darkness before sunrise. Put **broadband** targets in the real
   dark and **LP/dual-band nebulae** into twilight — the dual-band tolerates the brightening
