@@ -44,6 +44,17 @@ asleep through every decision the night needs.
 wakeup, or cron) for roughly every **15 minutes across the whole dark window**,
 before the first goto. On each wake: re-read altitude against the floor, drop
 rate, goal progress, and whether a planned target switch is due.
+- **Altitude:** `get_target_observability(target).now`: `alt_deg` at the real
+  current instant, with `above_floor` and `in_sweet_band` already judged against
+  the site's floor, horizon mask and field-rotation ceiling (`above_floor` true
+  but `in_sweet_band` false = above the ceiling). Not its `observability` block,
+  which is the whole night's plan. Local-only, so it costs the device nothing. An
+  off-catalog target returns `ok: false`; watch its planned window instead.
+- **Tracking, at least once per target while it stacks:** `get_status`, and
+  check `mount_tracking` is `true` (the device's native flag, not Alpaca's
+  `tracking`). `false` mid-stack → the anomaly-playbook branch "`mount_tracking`
+  false while stacking". `null` means the read failed; re-read on the next wake.
+  `get_status` costs six device reads, so once per target is enough.
 
 **2. A DETACHED park watchdog.** A plain script — no MCP, no agent — that talks
 to `seestar_alp` over HTTP, and at a fixed dawn deadline stops the view and
@@ -84,6 +95,23 @@ awake. Use a Monitor **in addition to** the heartbeat, never instead of it.
 Also tell the Monitor about the planned park time, or the scheduled fold reports
 as an "unexpected park" — the only alert that night was that false positive.
 
+**Use the shipped slot watcher as the Monitor's source** — do not hand-roll one.
+Run it under a Monitor with `timeout_ms=1800000`:
+
+```bash
+PYTHONIOENCODING=utf-8 uv --directory <repo> run python -m seestar_mcp.slot_watch \
+    --duration 1740 --every 60 --drop-burst 3 --milestone 60 --stall-polls 3
+```
+
+It reads only `get_view_state`, once a minute, and prints one line per event:
+a stage or target change, `DROPS +K`, `milestone`, `STALL`, `ENDED` (the
+session's `observing` turned false; carries the final counts and `errcode`) and
+`ERR`. Nothing prints while all is well. A Monitor kills its command after at
+most 30 min, so the window is 29 min: `watch window ended (re-arm to keep
+watching)` means re-arm it. A planned stop or park arrives as an `ENDED` line
+like any other, so check it against the plan before calling it unexpected. The
+watcher's silence is exactly why it rides alongside the heartbeat, never instead.
+
 ### State the guarantee honestly
 
 Before the user goes to bed, say plainly which layer survives you:
@@ -108,8 +136,12 @@ something outside the agent will run it.
      the firmware-7.18+ handshake failed. See the authentication branch in
      **`anomaly-playbook`**.
    Never report "the telescope is offline" when it is actually the bridge that is down.
-2. `get_view_state` — confirm no session is already in progress. If one is, ask the
-   user whether to stop it (`stop_view`) before starting a new target.
+2. `get_view_state` — confirm no session is already in progress: read `observing`,
+   which is `true` only while a session is actually running. A parked or stopped scope
+   keeps the ended session's View (`view_state` "cancel", `mode` "none"), and
+   `result: {}` is only what a freshly booted scope returns. So neither "a View is
+   present" nor `result: {}` is the test. If `observing` is `true`, ask the user
+   whether to stop it (`stop_view`) before starting a new target.
 3. Confirm thermal/dark readiness: the S50 builds darks at startup and they are
    temperature-linked. If the scope was just powered on or just moved indoors→outdoors,
    advise a 10–15 min acclimation before relying on stacked output. If the user plans
@@ -152,9 +184,12 @@ something outside the agent will run it.
    line.
 3. **Expect a multi-stage acquisition, and budget for it.** A goto normally progresses
    `Initialise` → `3PPA` (a 3-point plate-solve alignment, which runs its own `AutoFocus`)
-   → `AutoGoto` → `Stack`. On a healthy run this takes **~2–4 minutes** before the first
-   frame stacks. Budget it into every slot: a 45-minute slot yields roughly 42 minutes of
-   integration, and a six-target night spends ~20 minutes acquiring.
+   → `AutoGoto` → `Stack`. The **first goto of the night** runs that whole sequence,
+   autofocus included, and takes **~2–4 minutes** before the first frame stacks. **Later
+   gotos** usually skip the full `Initialise`/`3PPA` alignment and often stack within
+   **~1–2 minutes** (live test 2026-09-24). Budget it into every slot: a 45-minute slot
+   yields roughly 41–44 minutes of integration, and a six-target night spends roughly
+   7–14 minutes acquiring.
 4. **Verify the slew actually happened — `goto_target` returns ok even when the mount did
    NOT move.** Poll `get_view_state`. Healthy progress = plate-solves reaching `complete`,
    the `3PPA` percentage climbing, and `ScopeGoto` `dist_deg` shrinking toward ~0. Two
@@ -176,7 +211,9 @@ something outside the agent will run it.
    runs its own autofocus (visible as an `AutoFocus` event reaching `complete`, then the
    focuser settling). In the normal case there is nothing to do here: confirm focus was
    established and record the position from `get_focuser_position` as the session baseline
-   for drift detection.
+   for drift detection. A later goto that skips `Initialise` (Phase 1) may not refocus:
+   the first acquisition's focus carries over, so do not wait for an `AutoFocus` event
+   that is not coming.
 2. **`run_autofocus` is optional and firmware-dependent.** The MCP tool exists, but on some
    firmware the underlying device method is unavailable and the call returns `ok: false`
    with `"method not found (code 103)"`. Use it only for a *deliberate mid-session
@@ -208,6 +245,14 @@ diagnosing inline:
   session. Route to anomaly-playbook.
 - Focus drifting from baseline → temperature change; consider a mid-session refocus.
 - Plate-solve dropping out → pointing / transparency.
+- `get_status.mount_tracking` `false` while stacking (the heartbeat's once-per-target
+  check, Phase 0) → tracking; anomaly-playbook "`mount_tracking` false while stacking".
+- Drops holding above ~40% past the first ~5 min while the solve stays on target, with the
+  LP filter in (`get_view_state.stack.frame_errcode` often 530, usually a bright moon up)
+  → anomaly-playbook "sustained drops with the LP filter".
+
+Between agent turns, the slot watcher (Phase 0) is the event source for these signals:
+its `STALL`, `DROPS` and `ENDED` lines say which one to check.
 
 **Tier-2 is a POST-session activity, not part of this loop.** `qa_tier2` scores FITS files in
 the **local** data directory, so it needs `download_subs` to have run first — and pulling
@@ -238,11 +283,13 @@ compact and phone-friendly — one line, lead with state.
 - **Keep the tool link warm (~every 5 min while running background work).** An MCP
   connection that goes quiet gets dropped: a client polling continuously survived 8.8 h,
   while sessions with 40–60 min silences died repeatedly mid-run. If you are watching a long
-  slot with something other than MCP tools, call a **local-only** tool on a slow cadence —
-  `get_site_profile`, `list_projects` or `get_run_state`. All three read local files and
+  slot with something other than MCP tools (the slot watcher, for one), call a
+  **local-only** tool on a slow cadence — `get_site_profile`, `list_projects` or
+  `get_run_state`. All three read local files and
   **cost the device nothing**. Skipping this is why a target boundary arrives with no working
   tool link and the slew has to be improvised.
-- **Sweet-band watch:** track where the current target sits in its window. When it leaves
+- **Sweet-band watch:** track where the current target sits in its window, from
+  `get_target_observability(target).now` on each heartbeat (Phase 0). When it leaves
   its sweet band — crossing the field-rotation ceiling on the way down, or dropping toward
   the altitude floor / into the horizon mask — tell the user in one line and offer the next
   target from the plan (`plan_targets`), e.g.
@@ -253,9 +300,10 @@ compact and phone-friendly — one line, lead with state.
 `stacked N` confirms frames are landing — NOT that the object is framed, focused, or
 cloud-free. **Check the actual field at least once per target, EARLY (~5–10 min in), not
 only at the end.** The cheapest source is the live plate-solve annotation: `get_view_state`
-→ `Stack.Annotate` gives the object's centre `pixelx`/`pixely` and `radius` in the
-1080×1920 frame. Alternatively pull the newest sub JPG the scope writes to its share
-(on the tested firmware, `_LP_` in the filename confirms the dual-band filter engaged and
+→ `stack.target_px` (`[x, y]`) and `stack.target_radius_px` give the object's annotated
+centre and radius in the 1080×1920 frame (the `Stack.Annotate` entry whose name matches the
+target; `null` when none matches). Alternatively pull the newest sub JPG the scope writes to
+its share (on the tested firmware, `_LP_` in the filename confirms the dual-band filter engaged and
 `_IRCUT_` means broadband — check your own filenames if the convention differs).
 
 **Filter indices — never guess one.** `set_filter(position)` takes a bare integer, and
@@ -275,7 +323,13 @@ Confirm three things: the object is **in frame**, stars are **tight** (focus goo
 background is **clean** (no cloud haze).
 
 **If the object is off-centre, classify the offset before reacting.** The frame centre is
-(540, 960); compare it against the annotated centre.
+(540, 960); compare it against the annotated centre (`stack.target_px`).
+
+**Never judge framing from solve coordinates.** `plate_solve`'s `ra_deg`/`dec_deg` (like
+`stack.solve_ra_deg`/`solve_dec_deg`) and the FITS header `RA`/`DEC` report a position near
+the COMMANDED target, not the true field centre. On M1 the solve sat ~4′ from the target
+while the object sat ~23′ off-centre in the frame (live test 2026-09-24). Only the Annotate
+pixel position measures framing.
 
 | Evidence | Reading | Action |
 |---|---|---|
@@ -288,7 +342,8 @@ single off-centre frame proves nothing, because alt-az rotation smears a fixed a
 around the frame as the target moves. Once classified as systematic, do not spend session
 time or power-cycles chasing a re-centre; note it and keep imaging. (For calibration: one
 reference S50 measured a ~20–30′ frame-left offset that persisted through a power-cycle,
-re-level, and fresh dark alignment.)
+re-level, and fresh dark alignment. Confirmed against image data on 2026-09-24: averaged raw
+subs placed M1 where Annotate said it was.)
 
 For faint nebulae a single 10 s sub barely shows the object — that is normal; the
 accumulated stack reveals it. The check here is framing/focus/clouds, not depth.
@@ -319,7 +374,8 @@ the session run quietly.
    Then state the updated project progress in one line:
    `M31 logged: +25 min → 3.0 h of 6 h.`
 5. If the user is done for the night, `park` the mount and confirm the fold:
-   `get_status.mount_parked` is `true` (poll for up to ~4 min; the fold takes 1–3 min).
+   `get_status.mount_parked` is `true`. The fold typically completes in ~20–30 s (live
+   test 2026-09-24); keep polling up to ~4 min before calling it failed.
    Not `tracking`, which is Alpaca's view and disagrees with the device on this hardware.
    `shutdown` only if they ask — shutdown ends the seestar_alp link.
 
