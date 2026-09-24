@@ -148,7 +148,7 @@ It should live in the repo, next to the dawn watchdog, as a supported tool.
 2. `docs/CONTRACT.md`. v1.2.0 is unreleased (this branch is unmerged), so EXTEND the existing v1.2.0 entry rather than adding v1.3.0:
    - the precise `date` rule: "the night in progress from astronomical dusk to astronomical dawn; the next night after dawn";
    - a `warning` field on command-tool success, from firmware code-0 error replies;
-   - `plate_solve`'s additive fields and its polling, which can take up to ~30 s;
+   - `plate_solve`'s additive fields and its polling, which can take up to ~30 s. Caveat: `ra_deg`/`dec_deg` are the solver's REPORTED position, which on fw 8.46 sits near the commanded target and not at the true field centre. Offline image data showed the object ~23′ off-centre while the reported position was ~4′ from it. For framing, use `get_view_state.stack.target_px`.
    - `get_target_observability.now`;
    - `get_view_state.observing` and `.stack`. `observing` is true only when `View.state == "working"`. A parked scope keeps the ended session's View (`state` "cancel", `mode` "none"). `stack` stays present for an ended session and is null only for a fresh `result: {}`.
    - `dark_window_utc` edges carry about ±5 min jitter (5-min sun grid anchored at call time).
@@ -165,7 +165,7 @@ It should live in the repo, next to the dawn watchdog, as a supported tool.
 - M57 with the LP (dual-band) filter and a 93% moon up dropped ~55% of frames. `get_view_state` → `Stack.frame_errcode` was 530, and the plate-solve stayed on target. Re-acquiring the same target broadband dropped 6%. M1 with LP after moonset dropped 0%.
 - A repeat `park` on a folded scope and `stop_view` on an idle scope both return code 0 and are harmless.
 - `mount_tracking == true` during stacking was NOT verified live, because the heartbeat never called `get_status` mid-stack.
-- For M1, a fresh `plate_solve` put the field centre ~4′ from the target, while the live-stack Annotate pixel position implied ~23′. The skills' "systematic 20–30′ frame-left offset" note was derived from Annotate pixels and is now unverified.
+- For M1, a fresh `plate_solve` reported a position ~4′ from the target, while the live-stack Annotate pixel position implied ~23′ off-centre. **SETTLED OFFLINE:** averaging 60 downloaded raw M1 subs puts the nebula at pixel (150, 1372), which matches Annotate's (142, 1395). So the Annotate pixel positions are correct, and the ~20–30′ systematic offset is REAL. The solver's reported `ra_dec` and the FITS header `RA`/`DEC` both sit near the COMMANDED target, not the true field centre. On fw 8.46 they are not a framing measure.
 - Tasks 2, 4, 5 and 6 add `plate_solve` fields and polling, `get_target_observability.now`, the `get_view_state` `observing`/`stack` summary, and the shipped slot watcher.
 - The dashboard's pass showed that a parked scope keeps the ended session's View (`state` "cancel", `mode` "none"). "Is a session running" must use `get_view_state.observing`, not "View present" and not `result: {}`. Fix any skill text that says `result: {}` means idle (e.g. `run-session` Phase 0.1 step 2). CLAUDE.md's gotcha is Task 7's job.
 
@@ -183,7 +183,7 @@ It should live in the repo, next to the dawn watchdog, as a supported tool.
    - Action: `stop_view` and re-acquire the same target with `use_lp_filter=false`. This is a same-target re-acquire inside an approved plan, so no fresh confirmation is needed in an authorised autonomous night.
    - Cite the M57 numbers without site details.
 4. `run-session` framing section:
-   - Mark the 20–30′ offset calibration note as UNVERIFIED. Annotate pixels disagreed with a fresh plate-solve on 2026-09-24.
-   - Prefer the `plate_solve` centre (`ra_deg`/`dec_deg`) for pointing judgements until offline FITS verification settles it.
+   - Keep the 20–30′ offset calibration note, now marked as confirmed against image data on 2026-09-24. Averaged raw subs placed M1 where Annotate said.
+   - Add one caution: `plate_solve`'s `ra_deg`/`dec_deg` and the FITS header RA/DEC report a position near the COMMANDED target, not the true field centre. Judge framing from the Annotate pixel position (`get_view_state.stack.target_px`), not from the solve coordinates.
    - Keep the "classify before reacting" table.
 5. Mention nowhere any site coordinate, place name or time or altitude computed at the real site.
