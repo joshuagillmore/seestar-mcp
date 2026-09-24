@@ -231,8 +231,10 @@ Non-obvious behaviors that cost real observing time when ignored.
 - **Confirm framing with a real image, not telemetry.** Once per target (early), check the
   object is in frame, focused, and cloud-free — cheaply via the live plate-solve annotation
   (`get_view_state` → `stack.target_px` + `stack.target_radius_px`), or the newest sub JPG
-  from the scope's share. Never from `plate_solve`'s `ra_deg`/`dec_deg`: they sit near the
-  commanded target, not the field centre. Frame counts don't prove the object is in frame.
+  from the scope's share. Not from `plate_solve`'s `ra_deg`/`dec_deg`: they are the field
+  centre in JNow, and only `ra_j2000_deg`/`dec_j2000_deg` compare with the catalog
+  (corrected 2026-09-24: the old "near the commanded target" reading was J2000-vs-JNow
+  precession). Frame counts don't prove the object is in frame.
   If it is off-centre, **classify the offset** with the procedure in **`run-session`**
   ("Visual framing check") before reacting — do not assume it is systematic, and do not
   burn a slot re-centring one that is.
@@ -241,8 +243,9 @@ Non-obvious behaviors that cost real observing time when ignored.
   dark and **LP/dual-band nebulae** into twilight — the dual-band tolerates the brightening
   sky far better. Expect the drop rate to climb sharply toward dawn; that's the natural end
   of the useful night, not a fault to chase.
-- **Coordinates:** pass catalog **J2000 degrees** to `goto_target` — it converts RA to the
-  firmware's hours internally. Don't pre-convert to hours (it double-converts).
+- **Coordinates:** pass catalog **J2000 degrees** to `goto_target` — it precesses them to
+  JNow and converts RA to the firmware's hours internally. Don't pre-convert to hours or
+  pre-precess to JNow (either one is then applied twice).
 - **Never run a file offload off the scope's share during the run.** Heavy transfers compete
   with the scope's control link and can starve it — the run may stall, or the bridge may fail
   to authenticate. Do offloads before the run or after wind-down only.

@@ -91,7 +91,9 @@ attribute rejections to rotation on elapsed time alone.
 ## Symptom: sustained drops with the LP filter (usually a bright moon)
 Trigger: the target was acquired with `use_lp_filter=true` (`get_view_state` →
 `stack.lp_filter` is `true`), and after the first ~5 min of settling its drop rate stays
-above ~40% while the plate-solve stays on target. Measure the drop rate from the ~5-minute
+above ~40% while the plate-solve stays on target (judge that against the catalog with
+`stack.solve_ra_j2000_deg`/`solve_dec_j2000_deg`: the JNow `solve_ra_deg`/`solve_dec_deg`
+sit up to ~22′ from it by precession alone). Measure the drop rate from the ~5-minute
 mark on: frames dropped since then ÷ all frames since then, from `stack.dropped` and
 `stack.stacked`.
 `stack.frame_errcode` is often 530; the slot watcher shows it as repeated `DROPS` lines.

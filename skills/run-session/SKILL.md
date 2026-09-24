@@ -187,7 +187,8 @@ something outside the agent will run it.
 ## Phase 1 — Acquire target
 1. Resolve the target to RA/Dec if the user gave a name (use catalog coordinates; if
    uncertain, say so and ask). Pass **J2000 coordinates in DEGREES** — `goto_target`
-   converts RA to the firmware's hours internally. Do NOT pre-convert to hours.
+   precesses them to JNow (the frame the firmware works in) and converts RA to hours
+   internally. Do NOT pre-convert to hours or pre-precess to JNow.
 2. `goto_target(name, ra, dec, use_lp_filter)` — set the LP/dual-band filter ON for
    emission nebulae and planetaries (they emit Hα/OIII, which the filter passes and which
    tolerates light pollution and even twilight); leave it OFF for galaxies, clusters,
@@ -341,11 +342,15 @@ background is **clean** (no cloud haze).
 **If the object is off-centre, classify the offset before reacting.** The frame centre is
 (540, 960); compare it against the annotated centre (`stack.target_px`).
 
-**Never judge framing from solve coordinates.** `plate_solve`'s `ra_deg`/`dec_deg` (like
-`stack.solve_ra_deg`/`solve_dec_deg`) and the FITS header `RA`/`DEC` report a position near
-the COMMANDED target, not the true field centre. On M1 the solve sat ~4′ from the target
-while the object sat ~23′ off-centre in the frame (live test 2026-09-24). Only the Annotate
-pixel position measures framing.
+**Judge framing from the Annotate pixel position, not solve coordinates.** `plate_solve`'s
+`ra_deg`/`dec_deg` (like `stack.solve_ra_deg`/`solve_dec_deg`) are the solved field centre
+in JNow, the frame the firmware works in; the FITS header `RA`/`DEC` are JNow as well. To
+compare with the catalog, use `ra_j2000_deg`/`dec_j2000_deg` (`stack.solve_ra_j2000_deg`/
+`solve_dec_j2000_deg`), never the JNow pair: the two differ by the precession since J2000,
+up to ~22′, which looks exactly like a pointing error. (Corrected 2026-09-24: this note
+said solve coordinates sit near the COMMANDED target, not the field centre. That was
+J2000-vs-JNow precession: `goto_target` sent J2000 numbers, the firmware centred them as
+JNow, and the solve reported that centre.)
 
 | Evidence | Reading | Action |
 |---|---|---|
@@ -356,10 +361,12 @@ pixel position measures framing.
 Two captures at **different sky angles** are the minimum evidence for "systematic" — a
 single off-centre frame proves nothing, because alt-az rotation smears a fixed angular error
 around the frame as the target moves. Once classified as systematic, do not spend session
-time or power-cycles chasing a re-centre; note it and keep imaging. (For calibration: one
-reference S50 measured a ~20–30′ frame-left offset that persisted through a power-cycle,
-re-level, and fresh dark alignment. Confirmed against image data on 2026-09-24: averaged raw
-subs placed M1 where Annotate said it was.)
+time or power-cycles chasing a re-centre; note it and keep imaging. (For calibration: now
+that `goto_target` precesses J2000 → JNow, expect only the mount's residual pointing error,
+a few arcminutes — pending live confirmation. SUPERSEDED: one reference S50's ~20–30′
+frame-left offset, which persisted through a power-cycle, re-level, and fresh dark
+alignment, was J2000-vs-JNow precession, not hardware. Averaged raw subs did confirm
+Annotate's position for M1 on 2026-09-24, so `stack.target_px` stays the framing measure.)
 
 For faint nebulae a single 10 s sub barely shows the object — that is normal; the
 accumulated stack reveals it. The check here is framing/focus/clouds, not depth.
