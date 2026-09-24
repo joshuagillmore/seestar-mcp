@@ -98,17 +98,19 @@ The live payload shape, while stacking:
 - `result.View.Stack` was `{"state": "working", "lapse_ms": 141126, "frame_errcode": 530, "stacked_frame": 3, "dropped_frame": 7, "can_annotate": true, "PlateSolve": {"state": "complete", "lapse_ms": 2763, "ra_dec": [18.89505, 33.015196]}, "stage": "PlateSolve", "Exposure": {"state": "working", "lapse_ms": 10033, "exp_ms": 10000.0, "port": 4700}}`.
 - `Stack.Annotate` was `{"state": "complete", "result": {"image_size": [1080, 1920], "annotations": [{"names": ["NGC 6720", "Ring Nebula", "M 57"], "pixelx": 438.0, "pixely": 672.0, "radius": 16.0}, ...], "image_id": ...}}`. Annotation names can contain non-ASCII characters (e.g. "ν1 Lyr").
 
-On an idle scope the reply was `{"jsonrpc": "2.0", "Timestamp": "606.130373434", "method": "get_view_state", "result": {}, "code": 0, "id": 10078}`.
+A freshly booted scope that has run no view replied `{"jsonrpc": "2.0", "Timestamp": "606.130373434", "method": "get_view_state", "result": {}, "code": 0, "id": 10078}`.
+
+**AMENDED (dashboard read-only pass, 2026-09-24 12:00Z):** a PARKED scope does NOT return `result: {}`. It keeps the ended session's View, with `result.View.state == "cancel"`, `result.View.mode == "none"`, `Stack.state == "cancel"`, the final `stacked_frame` (1003) and `frame_errcode` 266. Observed `View.state` values are `"working"` (active session) and `"cancel"` (ended or stopped); `"complete"` appears on sub-steps. Assume a `"fail"` value exists. So "observing" must mean `View.state == "working"` and `View.mode != "none"`, NOT "result is non-empty".
 
 **Requirements:**
 1. Keep `view_state` (raw) unchanged, and ADD these fields:
-   - `idle: bool` (true when `result` is `{}`)
-   - `stack`: `null` when idle, otherwise:
+   - `observing: bool`: true ONLY when `View.state == "working"` and `View.mode != "none"`. It is false for `result: {}`, for an ended or cancelled session, for any other state, and for junk.
+   - `stack`: `null` when there is no `View` at all (`result: {}`). It is present whenever a View exists, INCLUDING an ended session, so its final counts stay visible:
 
-     `{"target_name", "stage", "state", "lp_filter", "stacked", "dropped", "frame_errcode", "solve_ra_deg", "solve_dec_deg", "annotate_state", "target_px": [x, y] | null, "target_radius_px" | null}`
+     `{"target_name", "view_state", "mode", "stage", "state", "lp_filter", "stacked", "dropped", "frame_errcode", "solve_ra_deg", "solve_dec_deg", "annotate_state", "target_px": [x, y] | null, "target_radius_px" | null}`
 
-   `target_px` is the annotation whose `names` match `target_name`: normalise case and spaces, so "M 57" matches "M57". Use null when there is no match. Values missing from the payload are null. A pure `_summarize_view_state(state) -> tuple[bool, dict | None]` next to the other parsers.
-2. Tests, written first, use the captured payloads above: stacking, idle, and a partial or odd payload (missing `Stack`, non-dict), which never raises.
+   `target_px` is the annotation whose `names` match `target_name`: normalise case and spaces, so "M 57" matches "M57". Use null when there is no match. Values missing from the payload are null. A pure `_summarize_view_state(state) -> tuple[bool, dict | None]` next to the other parsers returns `(observing, stack)`.
+2. Tests, written first, use the captured payloads above: stacking (`observing` true), fresh-boot `result: {}` (`observing` false, `stack` null), and a parked/ended session built from the amended facts (`state` "cancel", `mode` "none", `stacked_frame` 1003, `frame_errcode` 266; `observing` false, `stack` present with the counts). Add a partial or odd payload (missing `Stack`, non-dict) that never raises.
 3. Update the tool description to mention the summary.
 
 ## Task 6: Ship the slot watcher
@@ -117,7 +119,7 @@ On an idle scope the reply was `{"jsonrpc": "2.0", "Timestamp": "606.130373434",
 - a stage change;
 - a burst of ≥3 drops in one poll;
 - a stall (stacked flat for 3 consecutive polls while stage is `Stack`);
-- the view becoming idle;
+- the view becoming idle. AMENDED: this means `observing` turning false, using Task 5's rule. A parked or ended session reads `View.state` "cancel", not `result: {}`. Emit one line saying the session ended, with the final counts and the errcode.
 - an error;
 - every 60 stacked frames.
 
@@ -148,12 +150,12 @@ It should live in the repo, next to the dawn watchdog, as a supported tool.
    - a `warning` field on command-tool success, from firmware code-0 error replies;
    - `plate_solve`'s additive fields and its polling, which can take up to ~30 s;
    - `get_target_observability.now`;
-   - `get_view_state.idle` and `.stack`;
+   - `get_view_state.observing` and `.stack`. `observing` is true only when `View.state == "working"`. A parked scope keeps the ended session's View (`state` "cancel", `mode` "none"). `stack` stays present for an ended session and is null only for a fresh `result: {}`.
    - `dark_window_utc` edges carry about ±5 min jitter (5-min sun grid anchored at call time).
 
    If the contract tests pin keys for these tools, add the new keys to the `_require` lists. The Status row's test count must stay accurate.
 3. `CHANGELOG.md`: add entries under Unreleased for Tasks 1–6, in the existing style.
-4. `CLAUDE.md`: update the test count to match `uv run pytest --collect-only -q | tail -1` at the time of editing. Add a gotcha bullet: "firmware replies `{"error": ..., "code": 0}` from `pi_output_set2` although the change applies — code 0 is success (live test 2026-09-24)".
+4. `CLAUDE.md`: update the test count to match `uv run pytest --collect-only -q | tail -1` at the time of editing. Add a gotcha bullet: "firmware replies `{"error": ..., "code": 0}` from `pi_output_set2` although the change applies — code 0 is success (live test 2026-09-24)". Also correct the existing `get_view_state` gotcha: `result: {}` appears only on a fresh boot. A parked scope keeps the ended session's View (`state` "cancel", `mode` "none"), so "observing" means `View.state == "working"`.
 
 ## Task 8: Skills learn from the live test
 
@@ -164,7 +166,8 @@ It should live in the repo, next to the dawn watchdog, as a supported tool.
 - A repeat `park` on a folded scope and `stop_view` on an idle scope both return code 0 and are harmless.
 - `mount_tracking == true` during stacking was NOT verified live, because the heartbeat never called `get_status` mid-stack.
 - For M1, a fresh `plate_solve` put the field centre ~4′ from the target, while the live-stack Annotate pixel position implied ~23′. The skills' "systematic 20–30′ frame-left offset" note was derived from Annotate pixels and is now unverified.
-- Tasks 2, 4, 5 and 6 add `plate_solve` fields and polling, `get_target_observability.now`, the `get_view_state` `idle`/`stack` summary, and the shipped slot watcher.
+- Tasks 2, 4, 5 and 6 add `plate_solve` fields and polling, `get_target_observability.now`, the `get_view_state` `observing`/`stack` summary, and the shipped slot watcher.
+- The dashboard's pass showed that a parked scope keeps the ended session's View (`state` "cancel", `mode` "none"). "Is a session running" must use `get_view_state.observing`, not "View present" and not `result: {}`. Fix any skill text that says `result: {}` means idle (e.g. `run-session` Phase 0.1 step 2). CLAUDE.md's gotcha is Task 7's job.
 
 **Requirements (skills only, surgical edits in each skill's voice; verify every tool, field or flag name against the code at this branch's HEAD):**
 1. `run-session` and `autonomous-night`:
