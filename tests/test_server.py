@@ -348,6 +348,246 @@ async def test_get_status_transport_error_returns_ok_false():
     assert result["error_number"] == -1
 
 
+# --- Task 5 (live test 2026-09-24): get_view_state observing flag + stack summary
+# Payload captured live, fw 8.46, while stacking the Ring Nebula (target reported
+# as "M57"; the Annotate list spells it "M 57" -- the normalisation case).
+
+REAL_VIEW_STATE_STACKING = {
+    "jsonrpc": "2.0",
+    "result": {
+        "View": {
+            "state": "working",
+            "lapse_ms": 141126,
+            "mode": "star",
+            "cam_id": 0,
+            "target_ra_dec": [18.89505, 33.015196],
+            "target_name": "M57",
+            "lp_filter": True,
+            "gain": 80,
+            "stage": "Stack",
+            "Stack": {
+                "state": "working",
+                "lapse_ms": 141126,
+                "frame_errcode": 530,
+                "stacked_frame": 3,
+                "dropped_frame": 7,
+                "can_annotate": True,
+                "PlateSolve": {
+                    "state": "complete",
+                    "lapse_ms": 2763,
+                    "ra_dec": [18.89505, 33.015196],
+                },
+                "stage": "PlateSolve",
+                "Exposure": {
+                    "state": "working",
+                    "lapse_ms": 10033,
+                    "exp_ms": 10000.0,
+                    "port": 4700,
+                },
+                "Annotate": {
+                    "state": "complete",
+                    "result": {
+                        "image_size": [1080, 1920],
+                        "annotations": [
+                            {
+                                "names": ["NGC 6720", "Ring Nebula", "M 57"],
+                                "pixelx": 438.0,
+                                "pixely": 672.0,
+                                "radius": 16.0,
+                            },
+                            {
+                                # Annotation names can be non-ASCII (live test
+                                # 2026-09-24) -- must not raise or crash the match.
+                                "names": ["ν1 Lyr"],
+                                "pixelx": 12.0,
+                                "pixely": 34.0,
+                                "radius": 2.0,
+                            },
+                        ],
+                        "image_id": 42,
+                    },
+                },
+            },
+        },
+    },
+    "code": 0,
+    "id": 10001,
+}
+
+# A freshly booted scope that has run no view (captured live, 2026-09-24).
+FRESH_BOOT_VIEW_STATE = {
+    "jsonrpc": "2.0",
+    "Timestamp": "606.130373434",
+    "method": "get_view_state",
+    "result": {},
+    "code": 0,
+    "id": 10078,
+}
+
+# AMENDED finding (dashboard read-only pass, 2026-09-24 12:00Z): a PARKED scope
+# does NOT return result:{} -- it keeps the ended session's View, with
+# View.state "cancel", View.mode "none", Stack.state "cancel", and the final
+# stacked_frame/frame_errcode still present.
+PARKED_ENDED_VIEW_STATE = {
+    "jsonrpc": "2.0",
+    "result": {
+        "View": {
+            "state": "cancel",
+            "mode": "none",
+            "target_name": "M1",
+            "lp_filter": False,
+            "stage": "Stack",
+            "Stack": {
+                "state": "cancel",
+                "frame_errcode": 266,
+                "stacked_frame": 1003,
+                "dropped_frame": 41,
+            },
+        },
+    },
+    "code": 0,
+    "id": 10099,
+}
+
+
+def test_summarize_view_state_while_stacking():
+    from seestar_mcp.server import _summarize_view_state
+
+    observing, stack = _summarize_view_state(REAL_VIEW_STATE_STACKING)
+
+    assert observing is True
+    assert stack == {
+        "target_name": "M57",
+        "view_state": "working",
+        "mode": "star",
+        "stage": "Stack",
+        "state": "working",
+        "lp_filter": True,
+        "stacked": 3,
+        "dropped": 7,
+        "frame_errcode": 530,
+        "solve_ra_deg": 18.89505 * 15,
+        "solve_dec_deg": 33.015196,
+        "annotate_state": "complete",
+        # "M57" (target_name) normalises to match the "M 57" annotation name.
+        "target_px": [438.0, 672.0],
+        "target_radius_px": 16.0,
+    }
+
+
+def test_summarize_view_state_fresh_boot_is_not_observing_and_stack_is_null():
+    from seestar_mcp.server import _summarize_view_state
+
+    observing, stack = _summarize_view_state(FRESH_BOOT_VIEW_STATE)
+
+    assert observing is False
+    assert stack is None
+
+
+def test_summarize_view_state_parked_keeps_the_ended_session_stack():
+    """A parked scope is not 'observing' but its final counts stay visible."""
+    from seestar_mcp.server import _summarize_view_state
+
+    observing, stack = _summarize_view_state(PARKED_ENDED_VIEW_STATE)
+
+    assert observing is False, "state=cancel, mode=none must not read as observing"
+    assert stack is not None
+    assert stack["view_state"] == "cancel"
+    assert stack["mode"] == "none"
+    assert stack["state"] == "cancel"
+    assert stack["stacked"] == 1003
+    assert stack["frame_errcode"] == 266
+    assert stack["target_px"] is None  # no Annotate on this payload
+
+
+def test_summarize_view_state_missing_stack_never_raises():
+    """A View with no Stack key at all (e.g. an Initialise-phase payload)."""
+    from seestar_mcp.server import _summarize_view_state
+
+    observing, stack = _summarize_view_state(
+        {
+            "result": {
+                "View": {"state": "working", "mode": "star", "stage": "Initialise"}
+            }
+        }
+    )
+
+    assert observing is True
+    assert stack == {
+        "target_name": None,
+        "view_state": "working",
+        "mode": "star",
+        "stage": "Initialise",
+        "state": None,
+        "lp_filter": None,
+        "stacked": None,
+        "dropped": None,
+        "frame_errcode": None,
+        "solve_ra_deg": None,
+        "solve_dec_deg": None,
+        "annotate_state": None,
+        "target_px": None,
+        "target_radius_px": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [None, "junk", 123, [], {}, {"result": "junk"}, {"result": {"View": "junk"}}],
+)
+def test_summarize_view_state_junk_never_raises(junk):
+    from seestar_mcp.server import _summarize_view_state
+
+    observing, stack = _summarize_view_state(junk)
+
+    assert observing is False
+    assert stack is None
+
+
+async def test_get_view_state_carries_observing_and_stack():
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = REAL_VIEW_STATE_STACKING
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    result = await ctrl.get_view_state()
+
+    assert result["ok"] is True
+    assert result["observing"] is True
+    assert result["stack"]["target_name"] == "M57"
+    assert result["stack"]["stacked"] == 3
+
+
+async def test_get_view_state_parked_scope_is_not_observing_via_the_tool():
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = PARKED_ENDED_VIEW_STATE
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    result = await ctrl.get_view_state()
+
+    assert result["ok"] is True
+    assert result["observing"] is False
+    assert result["stack"]["stacked"] == 1003
+
+
+async def test_get_view_state_fresh_boot_stack_is_null_via_the_tool():
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = FRESH_BOOT_VIEW_STATE
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    result = await ctrl.get_view_state()
+
+    assert result["ok"] is True
+    assert result["observing"] is False
+    assert result["stack"] is None
+
+
+async def test_get_view_state_tool_description_mentions_the_summary():
+    tools = {t.name: t for t in await mcp.list_tools()}
+    desc = tools["get_view_state"].description or ""
+    assert "observing" in desc.lower()
+    assert "stack" in desc.lower()
+
+
 # --- Regression tests for the 2026-07-12 live-session bugs ---
 
 

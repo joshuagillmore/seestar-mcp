@@ -270,13 +270,27 @@ class SeestarController:
             return _err(exc)
 
     async def get_view_state(self) -> dict:
-        """Read the device's live ``get_view_state`` telemetry (native method)."""
+        """Read the device's live ``get_view_state`` telemetry (native method).
+
+        Adds ``observing`` and ``stack`` (see :func:`_summarize_view_state`)
+        alongside the unchanged raw ``view_state`` -- live test 2026-09-24 found
+        every framing/drop check needed a scratch script to dig
+        ``stacked_frame``/``dropped_frame``/``frame_errcode`` and the Annotate
+        pixel position out of the raw payload by hand.
+        """
         try:
             self.provenance.log_call(tool="get_view_state", args={})
             state = await self.alpaca.method_sync("get_view_state")
             if (bad := _native_fail(state)) is not None:
                 return bad
-            return {"ok": True, "view_state": state, "warning": _native_warning(state)}
+            observing, stack = _summarize_view_state(state)
+            return {
+                "ok": True,
+                "view_state": state,
+                "observing": observing,
+                "stack": stack,
+                "warning": _native_warning(state),
+            }
         except AlpacaError as exc:
             return _err(exc)
 
@@ -2034,6 +2048,127 @@ def _parse_battery(info: Any) -> float | None:
     return None
 
 
+def _normalize_annotation_name(text: Any) -> str | None:
+    """Case/whitespace-fold an annotation or target name for matching.
+
+    "normalise case and spaces, so 'M 57' matches 'M57'" (task 5 brief,
+    2026-09-24). Annotation names can be non-ASCII (e.g. "ν1 Lyr");
+    ``str.lower()`` handles that fine. Returns ``None`` for anything that is
+    not a non-empty string, so callers can skip matching without raising.
+    """
+    if not isinstance(text, str):
+        return None
+    folded = "".join(text.split()).lower()
+    return folded or None
+
+
+def _summarize_view_state(state: Any) -> tuple[bool, dict | None]:
+    """Derive ``(observing, stack)`` from a raw ``get_view_state`` reply.
+
+    Used by :meth:`SeestarController.get_view_state` and (task 6) the slot
+    watcher, so it is a pure function next to the other parsers rather than
+    inlined -- both need the identical read of ``observing``.
+
+    ``observing`` is ``True`` ONLY when ``View.state == "working"`` and
+    ``View.mode != "none"``. HARDWARE-OBSERVED (live test 2026-09-24): a
+    freshly booted scope answers ``result: {}`` (no ``View`` at all), but a
+    PARKED scope does NOT -- it keeps the ended session's ``View``, with
+    ``state: "cancel"`` and ``mode: "none"``. So "observing" cannot be
+    "result is non-empty"; it must read ``View.state``/``View.mode``
+    specifically. Observed ``View.state`` values are ``"working"`` (active)
+    and ``"cancel"`` (ended/stopped); ``"complete"`` appears on sub-steps, and
+    a ``"fail"`` value is assumed to exist but was not observed live.
+
+    ``stack`` is ``None`` only when there is no ``View`` at all (``result:
+    {}``, missing, or a malformed payload). It is present whenever a ``View``
+    exists -- INCLUDING an ended/parked session, so its final
+    stacked/dropped/frame_errcode counts stay visible -- with these keys,
+    every one ``None`` when absent from the payload rather than omitted:
+    ``target_name``, ``view_state`` (``View.state``), ``mode``, ``stage``,
+    ``state`` (``Stack.state``), ``lp_filter``, ``stacked``
+    (``Stack.stacked_frame``), ``dropped`` (``Stack.dropped_frame``),
+    ``frame_errcode``, ``solve_ra_deg``/``solve_dec_deg`` (from
+    ``Stack.PlateSolve.ra_dec``, RA hours x 15 -- the solver's REPORTED
+    position, not the field centre, per ``_extract_solve_fields``),
+    ``annotate_state``, and ``target_px``/``target_radius_px`` -- the
+    ``Stack.Annotate`` annotation whose ``names`` match ``target_name`` after
+    :func:`_normalize_annotation_name`, or ``None`` when there is no match.
+    A missing ``Stack``, a non-dict ``Stack``/``Annotate``, or any other odd
+    shape degrades individual fields to ``None`` rather than raising.
+    """
+    result = state.get("result") if isinstance(state, dict) else None
+    view = result.get("View") if isinstance(result, dict) else None
+    if not isinstance(view, dict):
+        return (False, None)
+
+    view_state = view.get("state")
+    mode = view.get("mode")
+    observing = view_state == "working" and mode != "none"
+
+    stack_raw = view.get("Stack")
+    stack_src = stack_raw if isinstance(stack_raw, dict) else {}
+
+    def _num(v: Any) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    solve_ra_deg: float | None = None
+    solve_dec_deg: float | None = None
+    plate_solve = stack_src.get("PlateSolve")
+    if isinstance(plate_solve, dict):
+        ra_dec = plate_solve.get("ra_dec")
+        if isinstance(ra_dec, (list, tuple)) and len(ra_dec) == 2 and _num(ra_dec[0]) and _num(ra_dec[1]):
+            solve_ra_deg = ra_dec[0] * 15
+            solve_dec_deg = ra_dec[1]
+
+    annotate = stack_src.get("Annotate")
+    annotate_state: Any = None
+    target_px: list[float] | None = None
+    target_radius_px: float | None = None
+    if isinstance(annotate, dict):
+        annotate_state = annotate.get("state")
+        target_key = _normalize_annotation_name(view.get("target_name"))
+        annotate_result = annotate.get("result")
+        annotations = (
+            annotate_result.get("annotations")
+            if isinstance(annotate_result, dict)
+            else None
+        )
+        if target_key is not None and isinstance(annotations, list):
+            for ann in annotations:
+                if not isinstance(ann, dict):
+                    continue
+                names = ann.get("names")
+                if not isinstance(names, list):
+                    continue
+                if not any(_normalize_annotation_name(n) == target_key for n in names):
+                    continue
+                px, py = ann.get("pixelx"), ann.get("pixely")
+                if _num(px) and _num(py):
+                    target_px = [px, py]
+                radius = ann.get("radius")
+                if _num(radius):
+                    target_radius_px = radius
+                break
+
+    stack = {
+        "target_name": view.get("target_name"),
+        "view_state": view_state,
+        "mode": mode,
+        "stage": view.get("stage"),
+        "state": stack_src.get("state"),
+        "lp_filter": view.get("lp_filter"),
+        "stacked": stack_src.get("stacked_frame"),
+        "dropped": stack_src.get("dropped_frame"),
+        "frame_errcode": stack_src.get("frame_errcode"),
+        "solve_ra_deg": solve_ra_deg,
+        "solve_dec_deg": solve_dec_deg,
+        "annotate_state": annotate_state,
+        "target_px": target_px,
+        "target_radius_px": target_radius_px,
+    }
+    return (observing, stack)
+
+
 # ===========================================================================
 # Thin MCP registration. The transport is stdio (mcp.run() default): this
 # server opens NO inbound network port — Claude Code spawns it and speaks stdio,
@@ -2123,7 +2258,19 @@ async def get_status() -> dict:
 
 @mcp.tool()
 async def get_view_state() -> dict:
-    """Read the device's live view/stacking telemetry. Read-only."""
+    """Read the device's live view/stacking telemetry. Read-only.
+
+    ``observing`` is ``true`` ONLY while an active session is running
+    (``View.state == "working"`` and ``View.mode != "none"``); it is ``false``
+    for a freshly-booted scope (``result: {}``), an ended/cancelled/parked
+    session, or any other state. ``stack`` is a compact summary (target,
+    stage, stacked/dropped counts, frame_errcode, plate-solve position, and
+    the Annotate framing pixel position for the current target); it is
+    ``null`` only when there is no View at all, and stays present -- with its
+    final counts -- for an ended session. ``solve_ra_deg``/``solve_dec_deg``
+    are the solver's REPORTED position, not the field centre; for framing use
+    ``stack.target_px``.
+    """
     return await get_controller().get_view_state()
 
 
