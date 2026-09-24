@@ -157,6 +157,34 @@ def test_planning_when_bare_date_is_that_evenings_night():
     assert _near(dawn, "2026-09-23T09:25"), dawn
 
 
+# The in-dark pin above (test_planning_when_in_the_dark_is_unchanged, 02:00Z ~=
+# 22:00 EDT) is still before local midnight. The dashboard session (2026-09-24
+# review) verified the rule at both sides of it: inside the dark window -> that
+# night, unchanged, even after local midnight; after astronomical dawn -> the
+# NEXT night, not the one that just ended.
+
+
+def test_planning_when_after_local_midnight_still_in_the_dark_is_unchanged():
+    # 05:00Z ~= 01:00 EDT: after LOCAL midnight, still inside the night that
+    # began the previous evening.
+    when = planning_when(DC, "2026-09-23T05:00:00Z")
+    assert abs((_to_time(when) - _to_time("2026-09-23T05:00:00Z")).sec) < 1e-3
+    dusk, dawn = dark_window(DC, when)
+    assert _near(dusk, "2026-09-23T00:35"), dusk
+    assert _near(dawn, "2026-09-23T09:25"), dawn
+
+
+def test_planning_when_after_astronomical_dawn_moves_to_the_next_night():
+    # Just after dawn: the night that began the Sep 22 evening has ended, so
+    # planning_when must resolve to the NEXT night (Sep 23 evening -> Sep 24
+    # morning), not the one dark_window still reports as "nearest" (see
+    # test_dark_window_after_dawn_is_the_just_ended_night above).
+    when = planning_when(DC, "2026-09-23T09:40:00Z")
+    dusk, dawn = dark_window(DC, when)
+    assert _near(dusk, "2026-09-24T00:35"), dusk
+    assert _near(dawn, "2026-09-24T09:25"), dawn
+
+
 # lat 65 at the June solstice never reaches astro dark: dark_window takes its
 # "within 1 deg of the darkest sample" fallback, which idempotency must survive.
 HIGH_SUMMER = SiteProfile(name="h", lat_deg=65.0, lon_deg=-18.0, elevation_m=0.0)

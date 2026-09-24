@@ -941,3 +941,21 @@ def test_get_target_observability_now_honors_horizon_mask(tmp_path, monkeypatch)
     # but az=180 falls in the masked 170-190 arc below its 45-deg amin.
     assert now["above_floor"] is False
     assert now["in_sweet_band"] is False
+
+
+def test_get_target_observability_omitted_date_after_midnight_reports_in_progress_night(
+    tmp_path, monkeypatch
+):
+    """An omitted `date` at ~01:00 local, after local midnight but still dark,
+    reports the IN-PROGRESS night's `dark_window_utc` (dashboard session,
+    2026-09-24 review) -- the same instant pinned at the engine layer in
+    test_planning_astro.py::test_planning_when_after_local_midnight_still_in_the_dark_is_unchanged.
+    """
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    _freeze_now(monkeypatch, "2026-09-23T05:00:00+00:00")  # ~01:00 EDT
+
+    r = asyncio.run(c.get_target_observability("M31"))
+    assert r["ok"] is True
+    assert _is_sep22_evening(r["dark_window_utc"]), r["dark_window_utc"]
