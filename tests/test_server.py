@@ -1354,6 +1354,11 @@ async def test_plate_solve_tool_description_states_wait_and_degrees():
     desc = tools["plate_solve"].description or ""
     assert "30" in desc, "must state the call may take up to ~30s"
     assert "degrees" in desc.lower(), "must state RA is returned in degrees"
+    # Final review G4 (2026-09-24): the caveat is stated inline, not deferred
+    # to a Python docstring an MCP client never sees.
+    assert "NOT the field centre" in desc
+    assert "stack.target_px" in desc, "must name the framing field to use instead"
+    assert "SeestarController" not in desc
 
 
 # --- plate_solve's poll loop must be bounded independently of poll_interval_s
@@ -1446,7 +1451,7 @@ DEVICE_STATE_846 = {
     "result": {
         "device": {"name": "Seestar S50", "is_verified": True},
         "setting": {"lang": "en"},
-        "location_lon_lat": [-75.7, 45.4],
+        "location_lon_lat": [-0.0015, 51.4779],
         "pi_status": {"battery_capacity": 87},
         "mount": {
             "move_type": "none",

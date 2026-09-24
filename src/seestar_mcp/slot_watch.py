@@ -31,6 +31,8 @@ EVENTS (each one flushed line, prefixed HH:MM:SSZ)
     stage=S target=T stacked=N dropped=M     the first poll, a stage change,
                                              a new target, or a new session
     idle: ...                                the first poll finds no session
+    new stack on T (stacked N→M)             stacked fell on the same target: a
+                                             re-acquire restarted the stack
     DROPS +K in one poll (...)               at least --drop-burst new drops
     milestone stacked=N dropped=M            every --milestone stacked frames
     STALL: stacked flat at N for K polls     --stall-polls flat polls in Stack
@@ -142,7 +144,8 @@ class SlotWatcher:
         self._reset_counters()
 
     def _reset_counters(self) -> None:
-        """Forget the per-session baselines (new target, new or ended session).
+        """Forget the per-session baselines (new target, new or ended session,
+        or a new stack on the same target).
 
         A new session's counts are its own; comparing them with the last
         session's would invent drop bursts, milestones and stalls.
@@ -215,9 +218,20 @@ class SlotWatcher:
 
     def _observe_session(self, stack: dict) -> list[str]:
         stage, target = stack["stage"], stack["target_name"]
+        stacked = stack["stacked"]
         texts: list[str] = []
         new_session = self._observing is not True or target != self._target
         if new_session:
+            self._reset_counters()
+        elif (
+            _is_count(stacked) and _is_count(self._stacked) and stacked < self._stacked
+        ):
+            # Final review G11 (2026-09-24): a stack only counts up, so a
+            # decrease on the same target is a new stack -- qa_tier1's rule
+            # (task 3). A same-target re-acquire (the LP-filter branch's
+            # broadband retry) can land between two polls without `observing`
+            # ever reading false, and was otherwise silent.
+            texts.append(f"new stack on {_fmt(target)} (stacked {self._stacked}→{stacked})")
             self._reset_counters()
         if new_session or stage != self._stage:
             texts.append(

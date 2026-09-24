@@ -246,6 +246,53 @@ def test_new_session_after_an_end_is_announced_and_rebaselined():
     assert w.observe(_view(stacked=10, dropped=1), at(5)) == []
 
 
+# --- same-target restart (stacked decreasing) --------------------------------------
+# Final review G11 (2026-09-24): a same-target re-acquire (the LP-filter branch's
+# broadband re-acquire) can land between two polls without one ever reading
+# ``observing`` false. A stack only counts up, so a decrease is a new stack --
+# the same rule qa_tier1 uses (task 3) -- and it was not announced.
+
+
+def test_stacked_decrease_on_the_same_target_is_announced_as_a_new_stack():
+    w = SlotWatcher(milestone=10)
+    w.observe(_view(stacked=300, dropped=160), at(0))
+    w.observe(_view(stacked=300, dropped=161), at(1))  # flat x1 on the old stack
+
+    assert w.observe(_view(stacked=4, dropped=0), at(2)) == [
+        "01:02:00Z new stack on M57 (stacked 300→4)"
+    ]
+    # Milestones count from the new stack's own baseline.
+    assert w.observe(_view(stacked=9, dropped=0), at(3)) == []
+    assert w.observe(_view(stacked=11, dropped=1), at(4)) == [
+        "01:04:00Z milestone stacked=11 dropped=1"
+    ]
+    # Drops are measured from the new stack's baseline, not the old 161.
+    assert w.observe(_view(stacked=13, dropped=4), at(5)) == [
+        "01:05:00Z DROPS +3 in one poll (stacked=13 dropped=4 errcode=530)"
+    ]
+    # The old stack's flat poll does not carry over: a stall needs three new ones.
+    assert w.observe(_view(stacked=13, dropped=4), at(6)) == []
+    assert w.observe(_view(stacked=13, dropped=4), at(7)) == []
+    assert w.observe(_view(stacked=13, dropped=4), at(8)) == [
+        "01:08:00Z STALL: stacked flat at 13 for 3 polls (dropped=4 errcode=530)"
+    ]
+
+
+def test_stacked_decrease_across_an_acquisition_phase_is_still_a_new_stack():
+    """The re-acquire's Initialise poll carries no Stack block; the decrease is
+    measured against the last count seen, so it is still caught."""
+    w = SlotWatcher()
+    w.observe(_view(stacked=300, dropped=160), at(0))
+    assert w.observe(_initialising(), at(1)) == [
+        "01:01:00Z stage=Initialise target=M57 stacked=- dropped=-"
+    ]
+
+    assert w.observe(_view(stacked=2, dropped=0), at(3)) == [
+        "01:03:00Z new stack on M57 (stacked 300→2)",
+        "01:03:00Z stage=Stack target=M57 stacked=2 dropped=0",
+    ]
+
+
 # --- target change ---------------------------------------------------------------
 
 

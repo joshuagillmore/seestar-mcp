@@ -2117,10 +2117,11 @@ async def plate_solve() -> dict:
     """Plate-solve the current field and return the solution. Read-only pointing.
 
     Polls the device while the solve is in progress, up to ~30s, so this call
-    can take that long to return. ``ra_deg``/``dec_deg`` report the solver's
-    RA (converted from hours to degrees) and Dec — the solver's reported
-    position, not necessarily the true field centre (fw 8.46 caveat: see
-    SeestarController.plate_solve).
+    can take that long to return. ``ra_deg``/``dec_deg`` are the solver's
+    reported position (RA converted from hours to degrees). On fw 8.46 that
+    position sits near the COMMANDED target, NOT the field centre, even when
+    the object is well off-centre in the frame. Never judge framing from
+    them: use ``get_view_state`` → ``stack.target_px``.
     """
     return await get_controller().plate_solve()
 
