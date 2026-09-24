@@ -1442,8 +1442,9 @@ async def test_plate_solve_non_positive_timeout_fails_immediately(
 #: The mount block itself is captured verbatim (live test 2026-09-24), PARKED:
 #: {"move_type": "none", "close": True, "tracking": False, "equ_mode": False}
 #: -- replacing an earlier, merely-documented shape that happened to omit
-#: equ_mode. `close` became True after park; while imaging it read False (see
-#: DEVICE_STATE_846_IMAGING below) -- both captured on the same run.
+#: equ_mode. `close` became True after park; with the arm up and the scope
+#: idle it read False (see DEVICE_STATE_846_UNFOLDED_IDLE below) -- both
+#: captured on the same run.
 DEVICE_STATE_846 = {
     "jsonrpc": "2.0",
     "Timestamp": "412.118804211",
@@ -1464,12 +1465,14 @@ DEVICE_STATE_846 = {
     "id": 90311,
 }
 
-#: Same capture, mid-session while imaging: the arm is unfolded (`close`
-#: False). `tracking` still reads False from the device even while actively
-#: on-target -- Alpaca's own `/tracking` disagrees with this on the same
-#: hardware (see CLAUDE.md), which is exactly why get_status treats this
+#: Same run, read with the arm up (`close` False) BEFORE the night's first
+#: goto: the scope was idle, with no View and no stack. It shows only that an
+#: unfolded, idle mount reports `tracking` False. What `tracking` reads during
+#: a healthy stack is still UNVERIFIED on fw 8.46 (final review G1,
+#: 2026-09-24). Alpaca's own `/tracking` disagrees with the device's native
+#: flag on this hardware (see CLAUDE.md), which is why get_status treats the
 #: native field, not Alpaca's, as authoritative.
-DEVICE_STATE_846_IMAGING = {
+DEVICE_STATE_846_UNFOLDED_IDLE = {
     **DEVICE_STATE_846,
     "result": {
         **DEVICE_STATE_846["result"],
@@ -1487,7 +1490,7 @@ def test_parse_mount_state_reads_the_fw846_nested_shape():
     from seestar_mcp.server import _parse_mount_state
 
     assert _parse_mount_state(DEVICE_STATE_846) == (True, False)  # parked
-    assert _parse_mount_state(DEVICE_STATE_846_IMAGING) == (False, False)  # imaging
+    assert _parse_mount_state(DEVICE_STATE_846_UNFOLDED_IDLE) == (False, False)  # arm up
     # Flat mount dict for simple mocks.
     assert _parse_mount_state({"mount": {"close": True, "tracking": True}}) == (
         True,
@@ -1562,10 +1565,11 @@ async def test_get_status_carries_the_native_mount_state(tmp_path):
     assert ctrl.alpaca.method_sync.await_args.args == ("get_device_state",)
 
 
-async def test_get_status_carries_the_native_mount_state_while_imaging(tmp_path):
-    # Captured live 2026-09-24: mid-session the mount reports close:False
-    # (arm unfolded) and tracking:False (Alpaca disagrees; see CLAUDE.md).
-    ctrl = _status_ctl(tmp_path, device_reply=DEVICE_STATE_846_IMAGING)
+async def test_get_status_carries_the_native_mount_state_unfolded_idle(tmp_path):
+    # Captured live 2026-09-24 with the arm up before the first goto (idle, no
+    # stack): close:False and tracking:False. Mid-stack `tracking` is still
+    # unverified on fw 8.46 (final review G1). Alpaca disagrees; see CLAUDE.md.
+    ctrl = _status_ctl(tmp_path, device_reply=DEVICE_STATE_846_UNFOLDED_IDLE)
     out = await ctrl.get_status()
     assert {k: out[k] for k in _ALPACA_STATUS} == _ALPACA_STATUS
     assert out["mount_parked"] is False

@@ -15,12 +15,12 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   project URLs).
 - `python -m seestar_mcp.slot_watch`: a standalone slot watcher for a Claude Code Monitor.
   It polls only `get_view_state` and prints one line per stacking event (stage/target
-  change, a drop burst, a stacked-count milestone, a stall, or the session ending) instead
-  of the whole payload every poll. Its native-reply parsing (`_native_error`,
-  `_summarize_view_state`, and friends) moved into a new `native_reply.py` module shared
-  with `server.py`, so both read `observing` identically and the watcher does not pay
-  `server.py`'s FastMCP/astropy/photutils import cost (~5 s vs. ~0.7 s on the dev PC) for a
-  process re-armed every 29 minutes.
+  change, a new stack on the same target, a drop burst, a stacked-count milestone, a stall,
+  or the session ending) instead of the whole payload every poll. Its native-reply parsing
+  (`_native_error`, `_summarize_view_state`, and friends) moved into a new `native_reply.py`
+  module shared with `server.py`, so both read `observing` identically and the watcher does
+  not pay `server.py`'s FastMCP/astropy/photutils import cost (~5 s vs. ~0.7 s on the dev
+  PC) for a process re-armed every 29 minutes.
 
 ### Removed
 - **Refinement moved to its own repository** (`seestar-refine`, 2026-08-08): the AstroPipe
@@ -86,11 +86,15 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   well off-centre in the frame (offline image data: M1's nebula sat ~23′ off-centre while the
   solved position sat only ~4′ from the catalog position); use `get_view_state.stack.target_px`
   for framing instead.
-- `qa_tier1`'s trend baseline reset only on a stack-count DECREASE, so switching targets
-  mid-session (with the new target's stack count still rising) kept comparing it against the
-  previous target's baseline and could flag a false `stacking_stalled`. The baseline now also
-  resets on a target-name change, read from a new `target_name` field on the snapshot
-  (`View.target_name` / `Stack.target_name`).
+- `qa_tier1`'s trend baseline never reset. Across each `goto_target` it compared the new
+  target's stack count (e.g. 26) directly against the old target's final count (300), so it
+  reported `stacked_delta` -274 and flagged a false `stacking_stalled` after every target
+  switch. The snapshot now carries `target_name` (`View.target_name`, confirmed on
+  fw 7.75; `Stack.target_name` as a fallback), and the monitor treats a decrease in `stacked`,
+  or — when the firmware reports a name on both polls — a change of target, as the start of a
+  new stack. `stacked_delta`, `rejected_delta`, `hfd_delta` and stall detection now compare
+  only within the current stack, so on the first poll of a new stack `trends.stacked_delta`,
+  `trends.rejected_delta` and `trends.hfd_delta` are `null`.
 - `get_target_observability` reported only the whole night's observability, so checking the
   target's position right now needed a scratch astropy script. It gains a `now` block (`utc`,
   `alt_deg`, `az_deg`, `above_floor`, `in_sweet_band`) at the REAL current instant, independent
@@ -100,8 +104,8 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   of it by hand. It gains `observing` (`bool`, true only when `View.state == "working"` and
   `mode != "none"` — a parked scope keeps the ended session's `View`, with `state: "cancel"` /
   `mode: "none"`) and `stack` (a compact summary of target/stage/counts/plate-solve/framing;
-  `null` only for a fresh `result: {}`, and present — with its final counts — for an ended
-  session).
+  `null` when the reply has no View (a freshly booted scope's `result: {}`, or an unreadable
+  payload), and present — with its final counts — for an ended session).
 
 ### Changed
 - `SECURITY.md`: corrected the tool count (33 + 5), reworded the `seestar_alp` supply-chain

@@ -46,9 +46,11 @@ to create state; their shapes are not pinned.
 ## Shapes that are load-bearing and easy to break by accident
 
 - **`get_view_state` must stay valid with `result: {}` and no `View` key.** That
-  is the most common real response — a connected, idle scope. Fields *on* `View`
-  are deliberately not pinned: a mid-acquisition payload carries `Initialise` and
-  `stage` but no `Stack` at all.
+  is what a freshly booted scope returns. A parked or ended session does not:
+  it keeps its View (`state` "cancel", `mode` "none"). `observing` is the
+  running test, not an empty `result`. Fields *on* `View` are deliberately not
+  pinned: a mid-acquisition payload carries `Initialise` and `stage` but no
+  `Stack` at all.
 - **Plate-solve position lives at `Stack.Annotate.result.annotations[]`**, not
   flat on `Annotate`, and `image_size` is a two-element array.
 - **`qa_tier2.summary.subs[].name` is the filename STEM** — no extension. A join
@@ -134,6 +136,9 @@ to create state; their shapes are not pinned.
   off-centre in the frame — offline image data showed the object ~23′
   off-centre while the reported position was only ~4′ from it. For framing,
   use `get_view_state.stack.target_px`, not these fields.
+  A solve still in progress at `timeout_s` fails (`ok: false`) with `error`,
+  `raw` (the last `get_solve_result` reply), `waited_s` (seconds spent polling)
+  and `last_code` (the last native code seen, which is always 215 on this path).
   **`get_target_observability`** gained a `now` block (`utc`, `alt_deg`,
   `az_deg`, `above_floor`, `in_sweet_band`): the target's position at the REAL
   current instant, independent of `date` — `date` only selects which night
@@ -153,11 +158,19 @@ to create state; their shapes are not pinned.
   framing measure — it is what the offline image-data comparison above
   confirmed against the true off-centre object, and what `plate_solve`'s own
   caveat points callers to instead of its `ra_deg`/`dec_deg`.
+  **`qa_tier1`**'s `snapshot` gained `target_name` (string or `null`), read from
+  `View.target_name` (or `Stack.target_name`). The trend baseline, which never
+  reset before, now resets when a new stack starts: the target name changed
+  (when both polls report one) or `stacked` decreased. So on the first poll of
+  a new stack, `trends.stacked_delta`, `trends.rejected_delta` and
+  `trends.hfd_delta` are `null` rather than a delta against the previous stack,
+  and `stacking_stalled` counts only the current stack's polls.
   *Why:* the live test found every one of these needed a scratch script to dig
   the same numbers out of raw native replies by hand — a false `ok: false` on
   a heater toggle that had actually worked, a `plate_solve` that failed
-  outright on a slow solve, and no field answering "is the scope observing
-  right now" or "where is the target really, this instant."
+  outright on a slow solve, a `qa_tier1` poll across a target switch that
+  flagged a false `stacking_stalled`, and no field answering "is the scope
+  observing right now" or "where is the target really, this instant."
 - **v1.1.1** — `thresholds.eccentricity_marginal` is now guaranteed **finite** and
   **never above `thresholds.eccentricity_reject`**. No shape change; both were
   already true for every real session, and re-scoring the 970-sub reference night

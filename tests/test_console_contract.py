@@ -67,10 +67,12 @@ def _require(payload: dict, keys: list[str], where: str) -> None:
 def test_get_view_state_accepts_an_idle_scope_with_empty_result(tmp_path):
     """``result: {}`` with no ``View`` key must stay valid.
 
-    This is the most common real response — a connected, idle scope — and the
-    Console team now treats ``View`` as optional-and-nullable rather than merely
-    nullable because of it. If we ever start synthesising a ``View`` here, or
-    start erroring on the empty shape, their idle path breaks.
+    This is what a freshly booted scope returns, and the Console team treats
+    ``View`` as optional-and-nullable rather than merely nullable because of
+    it. A parked or ended session does NOT return it: it keeps its ``View``
+    (``state`` "cancel", ``mode`` "none"), so ``observing`` -- not an empty
+    ``result`` -- is the running test. If we ever start synthesising a ``View``
+    here, or start erroring on the empty shape, their fresh-boot path breaks.
 
     ``observing``/``stack`` (2026-09-24 live test follow-ups, still v1.2.0) are
     pinned here too: a fresh ``result: {}`` is the one case ``stack`` is null,

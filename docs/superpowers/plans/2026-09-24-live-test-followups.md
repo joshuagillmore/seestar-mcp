@@ -2,7 +2,7 @@
 
 **Spec:** the findings from the first live hardware test of `fix/review-2026-09-22` (night of 2026-09-23 to 09-24, firmware 8.46, driven through the MCP tools). Josh approved all nine follow-ups. Each task restates its finding, and the task text is the authority. The firmware replies quoted below were **captured live that night**, so use them verbatim as test fixtures.
 
-**Branch:** `fix/live-test-followups`, taken from `fix/review-2026-09-22` @ 83685b7. Work happens in the worktree `C:\Users\joshu\SeeStar-AI-live-followups`. NEVER edit the main checkout `C:\Users\joshu\SeeStar-AI`: live MCP servers load code from it. Aim for one commit, or a small series, per task.
+**Branch:** `fix/live-test-followups`, taken from `fix/review-2026-09-22` @ 83685b7. Work happens in a sibling worktree. NEVER edit the main checkout: live MCP servers load code from it. Aim for one commit, or a small series, per task.
 
 ## Global Constraints
 
