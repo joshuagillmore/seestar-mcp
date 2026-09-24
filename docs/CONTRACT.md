@@ -139,11 +139,20 @@ to create state; their shapes are not pinned.
   current instant, independent of `date` — `date` only selects which night
   `dark_window_utc`/`observability` describe.
   **`get_view_state`** gained `observing` (bool) and `stack` (dict or null).
-  `observing` is true only when `View.state == "working"`. A parked scope
-  keeps the ended session's View (`state` "cancel", `mode` "none"), so a
-  non-empty `result` is not itself "observing". `stack` stays present for an
-  ended session — with its final counts — and is null only for a fresh
-  `result: {}`.
+  `observing` is true only when `View.state == "working"` AND `View.mode !=
+  "none"` — a parked scope keeps the ended session's View (`state` "cancel",
+  `mode` "none"), so a non-empty `result` is not itself "observing". `stack`
+  is null when the reply has no View (a freshly booted scope's `result: {}`,
+  or an unreadable payload); it stays present — with its final counts — for
+  an ended session. Its keys: `target_name`, `view_state`, `mode`, `stage`,
+  `state`, `lp_filter`, `stacked`, `dropped`, `frame_errcode`, `solve_ra_deg`,
+  `solve_dec_deg`, `annotate_state`, `target_px`, `target_radius_px`.
+  `solve_ra_deg`/`solve_dec_deg` carry the same reported-position-not-
+  field-centre caveat as `plate_solve.ra_deg`/`dec_deg` above. `target_px`
+  (the Annotate pixel position for the current target) is the VERIFIED
+  framing measure — it is what the offline image-data comparison above
+  confirmed against the true off-centre object, and what `plate_solve`'s own
+  caveat points callers to instead of its `ra_deg`/`dec_deg`.
   *Why:* the live test found every one of these needed a scratch script to dig
   the same numbers out of raw native replies by hand — a false `ok: false` on
   a heater toggle that had actually worked, a `plate_solve` that failed

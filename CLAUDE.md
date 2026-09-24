@@ -99,7 +99,7 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
     `result.View.Stack.stacked_frame` / `dropped_frame`. `result: {}` appears only on a
     fresh boot — a PARKED scope keeps the ended session's `View`, with `state: "cancel"`
     and `mode: "none"` (live test 2026-09-24), so "observing" means `View.state ==
-    "working"`, not "`result` is non-empty".
+    "working"` AND `View.mode != "none"`, not "`result` is non-empty".
 - **Filter wheel indices (fw 8.46, hardware-verified):** `0 = dark`, `1 = IRCUT`, `2 = LP`. The
   device reports its own mapping via `get_wheel_setting`; read the current index with
   `get_wheel_position` and busy/idle with `get_wheel_state`. Prefer reading the mapping over
