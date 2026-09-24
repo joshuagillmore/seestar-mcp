@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import seestar_mcp.server as server_mod
 from seestar_mcp.config import Settings
 from seestar_mcp.planning.astro import Observability
@@ -818,3 +820,124 @@ def test_simulate_night_bare_date_schedules_that_evenings_night(tmp_path, monkey
     # plan_targets was handed the resolved instant, so it ranks the SAME night.
     site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
     assert dark_window(site, planned["date"]) == tuple(r["dark_window_utc"])
+
+
+# --- `now` block: live position vs floor/ceiling (live test 2026-09-24, Task 4) --
+# Every heartbeat needed a scratch astropy script to get the current target's
+# altitude/azimuth against the floor and ceiling; the tool reported the whole
+# night, not now. `now` is about the REAL current time, independent of `date`
+# (which only picks which night `observability`/`dark_window_utc` describe).
+
+
+def _freeze_now(monkeypatch, iso: str) -> None:
+    """Pin `datetime.now(timezone.utc)` to `iso` for the tool-layer clock read.
+
+    Patches `server_mod.datetime` (the module-level name `get_target_
+    observability` reads, per its own comment) rather than the stdlib
+    `datetime` module itself — astropy reads the real wall clock internally
+    (e.g. IERS polar-motion refresh) via its own `datetime` reference, and a
+    global patch broke that with a strict-type check unrelated to this test.
+    """
+    import datetime as datetime_module
+
+    frozen = datetime_module.datetime.fromisoformat(iso)
+
+    class _FrozenDatetime(datetime_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen.astimezone(tz) if tz else frozen
+
+    monkeypatch.setattr(server_mod, "datetime", _FrozenDatetime)
+
+
+def test_get_target_observability_now_matches_azalt_at_even_with_date(
+    tmp_path, monkeypatch
+):
+    """`now` reports the REAL current time even when `date` picks a different
+    night, and its alt/az match the pure `azalt_at` engine at that instant."""
+    from seestar_mcp.planning.astro import azalt_at
+    from seestar_mcp.planning.catalog import find_target
+    from seestar_mcp.planning.site import SiteProfile
+
+    c = _controller(tmp_path)
+    assert asyncio.run(c.set_site_profile(name="DC", lat=DC_LAT, lon=DC_LON))["ok"]
+
+    frozen_iso = "2026-09-23T05:00:00+00:00"
+    _freeze_now(monkeypatch, frozen_iso)
+
+    # `date` picks a DIFFERENT night (Sep 22 evening) than the frozen "now".
+    r = asyncio.run(c.get_target_observability("M31", date="2026-09-22"))
+    assert r["ok"] is True
+    assert "now" in r
+
+    site = SiteProfile(name="DC", lat_deg=DC_LAT, lon_deg=DC_LON)
+    expect_az, expect_alt = azalt_at(site, find_target("M31"), frozen_iso)
+
+    now = r["now"]
+    assert now["utc"] == frozen_iso
+    assert now["az_deg"] == pytest.approx(expect_az)
+    assert now["alt_deg"] == pytest.approx(expect_alt)
+
+
+def test_get_target_observability_now_booleans_flip_across_floor_and_ceiling(
+    tmp_path, monkeypatch
+):
+    """`now.above_floor`/`now.in_sweet_band` flip at the same floor/ceiling the
+    rest of the tool uses, for the same fixed alt/az."""
+    c = _controller(tmp_path)
+    monkeypatch.setattr(server_mod, "azalt_at", lambda site, target, when: (180.0, 40.0))
+
+    def _now_for(min_altitude_deg, field_rotation_ceiling_deg):
+        assert asyncio.run(
+            c.set_site_profile(
+                name="DC",
+                lat=DC_LAT,
+                lon=DC_LON,
+                min_altitude_deg=min_altitude_deg,
+                field_rotation_ceiling_deg=field_rotation_ceiling_deg,
+            )
+        )["ok"]
+        r = asyncio.run(c.get_target_observability("M31"))
+        assert r["ok"] is True
+        return r["now"]
+
+    # alt=40 is below a 50-deg floor: below the floor, so out of the band too.
+    below_floor = _now_for(50.0, 80.0)
+    assert below_floor["above_floor"] is False
+    assert below_floor["in_sweet_band"] is False
+
+    # alt=40 sits inside [20, 60]: both true.
+    in_band = _now_for(20.0, 60.0)
+    assert in_band["above_floor"] is True
+    assert in_band["in_sweet_band"] is True
+
+    # alt=40 clears a 20-deg floor but exceeds a 30-deg ceiling: up, but too
+    # high for clean alt-az subs.
+    above_ceiling = _now_for(20.0, 30.0)
+    assert above_ceiling["above_floor"] is True
+    assert above_ceiling["in_sweet_band"] is False
+
+
+def test_get_target_observability_now_honors_horizon_mask(tmp_path, monkeypatch):
+    """A masked az/alt zeroes out both booleans, exactly like the whole-night
+    `observability()` computation already does via `is_blocked`."""
+    c = _controller(tmp_path)
+    monkeypatch.setattr(server_mod, "azalt_at", lambda site, target, when: (180.0, 40.0))
+    assert asyncio.run(
+        c.set_site_profile(
+            name="DC",
+            lat=DC_LAT,
+            lon=DC_LON,
+            min_altitude_deg=20.0,
+            field_rotation_ceiling_deg=60.0,
+            horizon_mask=[[170.0, 190.0, 45.0]],
+        )
+    )["ok"]
+
+    r = asyncio.run(c.get_target_observability("M31"))
+    assert r["ok"] is True
+    now = r["now"]
+    # alt=40 clears the 20-deg global floor and sits under the 60-deg ceiling,
+    # but az=180 falls in the masked 170-190 arc below its 45-deg amin.
+    assert now["above_floor"] is False
+    assert now["in_sweet_band"] is False

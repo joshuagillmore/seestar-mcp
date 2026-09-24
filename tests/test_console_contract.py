@@ -758,11 +758,18 @@ def test_get_target_observability_tool_contract(tmp_path, monkeypatch):
     out = asyncio.run(c.get_target_observability("M31"))
 
     assert out["ok"] is True
-    # dark_window_utc (v1.2.0) names the night the observability describes.
+    # dark_window_utc (v1.2.0) names the night the observability describes;
+    # now (live test 2026-09-24, Task 4) is the target's REAL live position,
+    # present on every ok:true path regardless of dark_window_utc's night.
     _require(
         out,
-        ["ok", "target", "observability", "dark_window_utc"],
+        ["ok", "target", "observability", "dark_window_utc", "now"],
         "get_target_observability",
+    )
+    _require(
+        out["now"],
+        ["utc", "alt_deg", "az_deg", "above_floor", "in_sweet_band"],
+        "get_target_observability.now",
     )
     if out.get("observability"):
         _require(

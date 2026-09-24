@@ -62,7 +62,7 @@ from .planning.projects import (
     upsert_project,
 )
 from .planning.ranker import rank_targets
-from .planning.site import SiteProfile, load_site, save_site
+from .planning.site import SiteProfile, is_blocked, load_site, save_site
 from .planning.weather import assess_conditions as assess_conditions_weather
 from .provenance import ProvenanceLog, SessionManifest
 from .run_state import RunState, clear_run_state, read_run_state, write_run_state
@@ -1034,9 +1034,18 @@ class SeestarController:
         bare site-local date (``YYYY-MM-DD``) means the night beginning on that
         date's evening; omitted means tonight (or the current night if already
         dark) — see :func:`planning_when`. Read-only; no device motion.
-        """
-        from datetime import datetime, timezone
 
+        The result's ``now`` block is about the target's position at the REAL
+        current instant, independent of ``date``: ``date`` only selects which
+        night ``observability``/``dark_window_utc`` describe (live test
+        2026-09-24, Task 4 — every heartbeat needed a scratch astropy script to
+        get the current altitude/azimuth against the floor and ceiling).
+        """
+        # No local `from datetime import ...` here (unlike this method's
+        # siblings): `datetime`/`timezone` stay the module-level names imported
+        # at the top of this file so tests can monkeypatch `datetime` on this
+        # module directly for the `now` block below, without touching the
+        # stdlib `datetime` module (which astropy also reads internally).
         try:
             self.provenance.log_call(
                 tool="get_target_observability",
@@ -1056,11 +1065,32 @@ class SeestarController:
             # of letting it recompute the same window.
             window = dark_window(site, when)
             obs = observability(site, t, when, dark_window_utc=window)
+            # `now`: the REAL current instant, always (never `when`, which
+            # tracks `date`) — this is the only place in the method the clock
+            # is read a second time. Mirrors the exact above_floor/sweet-band
+            # formula `_observability` uses per-sample in astro.py, so `now`
+            # agrees with the rest of the result (live test 2026-09-24, Task 4).
+            now_iso = datetime.now(timezone.utc).isoformat()
+            now_az, now_alt = azalt_at(site, t, now_iso)
+            now_unblocked = not is_blocked(site, now_az, now_alt)
+            now_above_floor = now_alt >= site.min_altitude_deg and now_unblocked
+            now_in_sweet_band = (
+                now_alt >= site.min_altitude_deg
+                and now_alt <= site.field_rotation_ceiling_deg
+                and now_unblocked
+            )
             return {
                 "ok": True,
                 "target": dataclasses.asdict(t),
                 "observability": dataclasses.asdict(obs),
                 "dark_window_utc": window,
+                "now": {
+                    "utc": now_iso,
+                    "alt_deg": now_alt,
+                    "az_deg": now_az,
+                    "above_floor": now_above_floor,
+                    "in_sweet_band": now_in_sweet_band,
+                },
             }
         except Exception as exc:  # noqa: BLE001 - tool-facing never-raise contract
             return {"ok": False, "error": str(exc)}
@@ -2327,6 +2357,13 @@ async def get_target_observability(target: str, date: str | None = None) -> dict
     (ISO UTC instant) overrides "tonight": a bare site-local date
     (``YYYY-MM-DD``) means the night beginning on that date's evening; omitted
     means tonight (or the current night if already dark).
+
+    The result's ``now`` block (``utc``/``alt_deg``/``az_deg``/``above_floor``/
+    ``in_sweet_band``) is the target's position at the REAL current instant —
+    unrelated to ``date``, which only selects which night the rest of the
+    result (``observability``, ``dark_window_utc``) describes. Use ``now`` for
+    a live heartbeat check against the floor/ceiling; use ``observability`` for
+    the whole night's plan.
     """
     return await get_controller().get_target_observability(target, date)
 
