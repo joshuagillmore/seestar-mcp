@@ -452,7 +452,12 @@ class SeestarController:
         ``poll_interval_s`` (default ~2s) up to ``timeout_s`` (default ~30s);
         this call can take that long to return. Code 215 means "in progress"
         ONLY inside this polling loop — everywhere else a native 215 is an
-        ordinary error, like any other nonzero code.
+        ordinary error, like any other nonzero code. ``poll_interval_s`` is
+        floored at ``_MIN_POLL_INTERVAL_S`` (0.1s) so the loop is always
+        bounded by ``timeout_s`` regardless of what the caller passes —
+        ``poll_interval_s=0`` against a device stuck at 215 used to spin
+        forever (fix round 1, review finding F1, 2026-09-24). A non-positive
+        ``timeout_s`` fails on the first poll, before any sleep.
 
         On success the additive fields ``ra_deg``/``dec_deg``/``angle_deg``/
         ``fov_deg``/``star_number``/``solve_duration_ms`` sit next to the
@@ -479,6 +484,15 @@ class SeestarController:
             if (bad := _native_fail(started)) is not None:
                 return bad
 
+            # Fix round 1 (review finding F1, 2026-09-24): waited_s only
+            # advanced by poll_interval_s per iteration, so poll_interval_s=0
+            # against a device stuck at code 215 spun the loop forever --
+            # 0 >= timeout_s never became true. Bound the loop independently
+            # of the caller's poll_interval_s by flooring the interval used
+            # for both the sleep and the waited_s accumulation; waited_s still
+            # reports the actual (floored) time spent, never a lie.
+            effective_poll_interval_s = max(poll_interval_s, _MIN_POLL_INTERVAL_S)
+
             waited_s = 0.0
             result: Any = None
             while True:
@@ -497,8 +511,8 @@ class SeestarController:
                         "waited_s": waited_s,
                         "last_code": code,
                     }
-                await asyncio.sleep(poll_interval_s)
-                waited_s += poll_interval_s
+                await asyncio.sleep(effective_poll_interval_s)
+                waited_s += effective_poll_interval_s
 
             if (bad := _native_fail(result)) is not None:
                 return bad
@@ -1750,6 +1764,13 @@ def _native_warning(value: Any) -> str | None:
 #: :meth:`SeestarController.plate_solve`'s polling loop — everywhere else a
 #: native 215 is an ordinary error, like any other nonzero code.
 _SOLVE_IN_PROGRESS_CODE = 215
+
+#: Floor for plate_solve's polling interval (fix round 1, review finding F1,
+#: 2026-09-24): waited_s advances by this amount per iteration regardless of
+#: the caller's poll_interval_s, so poll_interval_s<=0 against a device stuck
+#: at code 215 cannot loop forever -- confirmed live to hang past a 3s
+#: wall-clock guard before this floor existed.
+_MIN_POLL_INTERVAL_S = 0.1
 
 
 def _native_solve_code(value: Any) -> Any:

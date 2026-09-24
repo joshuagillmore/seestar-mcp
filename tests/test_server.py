@@ -1004,12 +1004,31 @@ def _polling_solve_ctl(tmp_path, start_reply, solve_replies):
     return ctrl
 
 
+#: The real asyncio.sleep, captured at import time before any test patches
+#: server_mod.asyncio.sleep -- server_mod.asyncio IS the asyncio module (not a
+#: copy), so patching its "sleep" attribute patches asyncio.sleep everywhere,
+#: including this file's own `import asyncio`. fake_sleep below needs a
+#: not-patched reference to yield to the event loop for real (see its
+#: docstring).
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
+
+
 def _mock_sleep(monkeypatch):
-    """Replace asyncio.sleep with a recorder so polling tests never really sleep."""
+    """Replace asyncio.sleep with a recorder so polling tests never really sleep.
+
+    Each call still does a real, zero-duration ``await _REAL_ASYNCIO_SLEEP(0)``
+    -- not a real delay, but a genuine event-loop yield. Without it, a
+    poll loop whose every awaited call resolves synchronously (an AsyncMock,
+    plus a fake sleep with no internal await) never actually hands control
+    back to the event loop, so an `asyncio.wait_for` guard wrapped around it
+    cannot fire its cancellation and the test hangs for real instead of
+    failing (round-1 fix regression test needs this to be a true guard).
+    """
     slept = []
 
     async def fake_sleep(seconds):
         slept.append(seconds)
+        await _REAL_ASYNCIO_SLEEP(0)
 
     monkeypatch.setattr(server_mod.asyncio, "sleep", fake_sleep)
     return slept
@@ -1095,6 +1114,75 @@ async def test_plate_solve_tool_description_states_wait_and_degrees():
     desc = tools["plate_solve"].description or ""
     assert "30" in desc, "must state the call may take up to ~30s"
     assert "degrees" in desc.lower(), "must state RA is returned in degrees"
+
+
+# --- plate_solve's poll loop must be bounded independently of poll_interval_s
+# (fix round 1, review finding F1): waited_s only advanced by poll_interval_s
+# per iteration, so poll_interval_s=0 against a device stuck at code 215 spun
+# the loop forever -- 0 >= timeout_s never became true. Confirmed live:
+# ctrl.plate_solve(poll_interval_s=0, timeout_s=1.0) against an always-215
+# fake hung past a 3s wall-clock guard.
+
+
+def _always_215_solve_ctl(tmp_path, start_reply):
+    """Like _polling_solve_ctl, but get_solve_result NEVER stops answering 215.
+
+    A queued list of replies would just run out and raise; a device that is
+    truly stuck answers 215 indefinitely, which is exactly the case that must
+    not spin the loop forever.
+    """
+    ctrl = _native_ctl(tmp_path, None)
+
+    def side_effect(method, *_args, **_kwargs):
+        if method == "start_solve":
+            return start_reply
+        assert method == "get_solve_result"
+        return dict(_SOLVE_215_REPLY)
+
+    ctrl.alpaca.method_sync.side_effect = side_effect
+    return ctrl
+
+
+async def test_plate_solve_zero_poll_interval_does_not_spin_forever(
+    tmp_path, monkeypatch
+):
+    # asyncio.sleep is mocked (never really sleeps), so the only thing that
+    # can catch a true infinite loop is the wall-clock wait_for guard below --
+    # a regression here must fail the test, not hang the suite.
+    ctrl = _always_215_solve_ctl(tmp_path, _ACCEPTED_START_SOLVE)
+    slept = _mock_sleep(monkeypatch)
+
+    result = await asyncio.wait_for(
+        ctrl.plate_solve(poll_interval_s=0, timeout_s=1.0), timeout=3.0
+    )
+
+    assert result["ok"] is False
+    assert "215" in result["error"]
+    assert "solve_result" not in result
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    # Bounded: nowhere near "forever". Loose bound to avoid float-rounding
+    # brittleness on the waited_s accumulation.
+    assert len(methods) <= 20, f"poll loop was not bounded: {len(methods)} calls"
+    assert len(slept) <= 20
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, -5.0])
+async def test_plate_solve_non_positive_timeout_fails_immediately(
+    tmp_path, monkeypatch, timeout_s
+):
+    ctrl = _polling_solve_ctl(
+        tmp_path, _ACCEPTED_START_SOLVE, [dict(_SOLVE_215_REPLY)]
+    )
+    slept = _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve(timeout_s=timeout_s)
+
+    assert result["ok"] is False
+    assert "215" in result["error"]
+    assert "solve_result" not in result
+    assert slept == [], "a non-positive timeout must not poll-wait at all"
+    methods = [c.args[0] for c in ctrl.alpaca.method_sync.await_args_list]
+    assert methods == ["start_solve", "get_solve_result"]
 
 
 # --- get_status carries the authoritative native mount state -----------------
