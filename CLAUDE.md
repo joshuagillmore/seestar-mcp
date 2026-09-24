@@ -16,7 +16,7 @@ destructive. Runs on a Jetson, driven from the Claude phone app via Remote Contr
 There is **no bare `python`** on the dev machine (Windows Store shim). Always:
 
 ```bash
-uv run pytest            # full suite (496 tests, all green)
+uv run pytest            # full suite (534 tests, all green)
 uv run ruff check src tests
 uv run python -m seestar_mcp.server   # launch the MCP server (stdio)
 uv run python -c "..."   # one-off checks
@@ -110,6 +110,12 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
   Anything deciding whether the scope is parked or tracking must read the native state.
 - **Firmware replies `{"error": ..., "code": 0}` from `pi_output_set2` although the change
   applies — code 0 is success (live test 2026-09-24).**
+- **`goto_target` takes J2000; the firmware expects JNow — the server precesses (live test
+  2026-09-24: 9–22′ offsets matched precession).** `planning/astro.py` `j2000_to_jnow` /
+  `jnow_to_j2000` use FK5 at the equinox of date: precession only, no IERS download. Callers
+  must not pre-precess, or it is applied twice. Solve coordinates (`plate_solve.ra_deg`/
+  `dec_deg`, `get_view_state.stack.solve_ra_deg`/`solve_dec_deg`) ARE the field centre, in
+  JNow; compare the catalog with the `*_j2000_deg` fields beside them, never the JNow pair.
 - **Line endings:** commit with `git -c core.autocrlf=false commit`. Commit diff stats can look
   inflated (CRLF↔LF renormalization) — the content diff is what matters; tests are the gate.
 - **Field rotation (alt-az):** rank on *sweet-band* time `[min_alt, ~60° ceiling]`, NOT raw

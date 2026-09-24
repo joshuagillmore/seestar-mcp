@@ -81,11 +81,11 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   0.1 s so `poll_interval_s <= 0` against a device stuck at 215 cannot spin forever) up to
   `timeout_s` (default ~30 s); this call can now take that long to return. On success it also
   returns the additive `ra_deg`, `dec_deg`, `angle_deg`, `fov_deg`, `star_number`,
-  `solve_duration_ms` and `waited_s`. `ra_deg`/`dec_deg` are the solver's REPORTED position,
-  not the field centre — on fw 8.46 they sit near the commanded target even when the object is
-  well off-centre in the frame (offline image data: M1's nebula sat ~23′ off-centre while the
-  solved position sat only ~4′ from the catalog position); use `get_view_state.stack.target_px`
-  for framing instead.
+  `solve_duration_ms` and `waited_s`. `ra_deg`/`dec_deg` are the solved field centre in JNow
+  (equinox of date). This entry first called them "the solver's REPORTED position, not the
+  field centre", because they sat near the commanded target while M1's nebula sat ~23′
+  off-centre; that was J2000-vs-JNow precession (see the `goto_target` entry below). Use
+  `get_view_state.stack.target_px` for framing.
 - `qa_tier1`'s trend baseline never reset. Across each `goto_target` it compared the new
   target's stack count (e.g. 26) directly against the old target's final count (300), so it
   reported `stacked_delta` -274 and flagged a false `stacking_stalled` after every target
@@ -106,6 +106,25 @@ device paths are not yet hardware-validated (see the README "Status & limitation
   `mode: "none"`) and `stack` (a compact summary of target/stage/counts/plate-solve/framing;
   `null` when the reply has no View (a freshly booted scope's `result: {}`, or an unreadable
   payload), and present — with its final counts — for an ended session).
+- `goto_target` sent J2000 catalog coordinates, but the Seestar firmware works in JNow (mean
+  equator and equinox of date), so every target landed off-centre by the precession since
+  J2000: 8–23′ on the live test of 2026-09-23/24 (fw 8.46), while the phone app centred the
+  same objects. Predicted precession shift vs offset measured in frame: M92 9.1′/9.2′, M57
+  12.7′/12.6′, M1 22.4′/22.5′, M13 11.9′/8.2′ (M13 was the night's first goto, on a large
+  cluster, so its annotation centre is the least precise). `goto_target` still takes J2000
+  degrees and echoes them as `ra`/`dec`. It now precesses them to JNow at the current instant
+  before slewing (`planning/astro.py` `j2000_to_jnow`: FK5 precession only, no IERS download;
+  nutation and aberration, under 1′, are left out) and returns the additive `ra_jnow_deg`,
+  `dec_jnow_deg` and `epoch_utc`. A non-finite position or `|dec| > 90` fails `ok: false`
+  with nothing sent to the scope. The same mechanism explains why the solve seemed to sit
+  "near the commanded target": it is the true field centre, reported in JNow, and that was
+  numerically the J2000 numbers the goto had sent. `plate_solve` gains `ra_j2000_deg` /
+  `dec_j2000_deg` and `get_view_state.stack` gains `solve_ra_j2000_deg` /
+  `solve_dec_j2000_deg`: the same point precessed back to J2000 (`jnow_to_j2000`) for
+  comparison with the catalog, `null` without a solve position. On M1 the solve put the field
+  centre 25.3′ from M1's JNow position: the 22.4′ precession shift plus ~4′ of residual mount
+  pointing error. After this fix expect only that residual, a few arcminutes; that is pending
+  live confirmation. See `docs/CONTRACT.md` v1.3.0.
 
 ### Changed
 - `SECURITY.md`: corrected the tool count (33 + 5), reworded the `seestar_alp` supply-chain

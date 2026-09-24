@@ -706,7 +706,7 @@ def test_contract_version_is_declared_and_matches_this_suite():
     title = re.search(r"^# seestar-mcp consumer contract — v(\S+)", contract, re.M)
     assert title, "contract has no versioned title"
     version = title.group(1)
-    assert version == "1.2.0"
+    assert version == "1.3.0"
 
     # The Status table is the field a consumer actually pins against, so it must
     # agree with the title. They drifted apart once (title said 1.0.1, the table

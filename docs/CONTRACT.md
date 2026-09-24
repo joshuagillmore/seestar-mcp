@@ -1,4 +1,4 @@
-# seestar-mcp consumer contract — v1.2.0
+# seestar-mcp consumer contract — v1.3.0
 
 The response shapes external consumers may rely on, and the rules for changing
 them. Enforced by `tests/test_console_contract.py`, which fails **this** repo's
@@ -11,7 +11,7 @@ it end to end.
 
 | | |
 |---|---|
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Covers** | 11 of 34 tools — the ones a consumer actually parses |
 | **Validated against a real consumer** | yes — the SeeStar Console parsed a real 25-sub `qa_tier2` payload with an independently written schema, first try, no changes |
 | **Enforced by** | `tests/test_console_contract.py` (21 tests, all 11 pinned at the tool boundary) |
@@ -53,6 +53,13 @@ to create state; their shapes are not pinned.
   `Stack` at all.
 - **Plate-solve position lives at `Stack.Annotate.result.annotations[]`**, not
   flat on `Annotate`, and `image_size` is a two-element array.
+- **Solve coordinates are JNow; catalog coordinates are J2000.**
+  `plate_solve.ra_deg`/`dec_deg` and `get_view_state.stack.solve_ra_deg`/
+  `solve_dec_deg` are the field centre at the equinox of date, while
+  `goto_target` takes and echoes J2000. Compare a solve with a catalog
+  position through the `*_j2000_deg` fields (v1.3.0): the raw pair is off by
+  the precession since J2000, up to ~22′, which reads as a plausible pointing
+  error.
 - **`qa_tier2.summary.subs[].name` is the filename STEM** — no extension. A join
   key built as `f"{name}.fit"` matches nothing.
 - **Unanalysable subs stay in `subs[]`** with `metrics.error` set. Filtering them
@@ -83,6 +90,43 @@ to create state; their shapes are not pinned.
 
 ## Changelog
 
+- **v1.3.0** — additive keys on three tools, one behaviour change and one
+  correction; no key removed or renamed, no unit or frame changed.
+  **`goto_target`** now precesses the caller's J2000 `ra`/`dec` to JNow before
+  slewing — FK5 at the mean equator and equinox of the call's instant,
+  precession only (nutation and aberration, under 1′, are left out) — and
+  sends that to the firmware. The input contract is unchanged: `ra`/`dec`
+  are J2000 degrees, and the reply still echoes them as given. It gains
+  `ra_jnow_deg` / `dec_jnow_deg` (the position actually sent) and
+  `epoch_utc` (the instant used, offset-bearing ISO 8601), on success and on
+  the `ok: false` envelope of a native error. A position that cannot be
+  precessed — non-finite, or `|dec| > 90` — now fails `ok: false` with
+  nothing sent to the scope; an RA outside [0, 360) is wrapped.
+  **`plate_solve`** gained `ra_j2000_deg` / `dec_j2000_deg`, and
+  **`get_view_state.stack`** gained `solve_ra_j2000_deg` /
+  `solve_dec_j2000_deg`: the solved field centre precessed back to J2000 at
+  the time of the call, for comparison with the J2000 catalog. Each pair is
+  `null` when the solve has no position, or one the precession rejects.
+  **Correction:** `plate_solve.ra_deg`/`dec_deg` and
+  `stack.solve_ra_deg`/`solve_dec_deg` ARE the solved field centre, in JNow
+  (equinox of date). v1.2.0 called them "the solver's REPORTED position, not
+  the field centre". Their values are unchanged — only that description was
+  wrong — and the v1.2.0 entry below is corrected in place. Compare the
+  catalog with the `*_j2000_deg` fields, never the JNow pair: the two frames
+  differ by the precession since J2000, up to ~22′. `stack.target_px` stays
+  the framing measure.
+  *Why:* on the live test of 2026-09-23/24 (fw 8.46), objects imaged through
+  the MCP landed 8–23′ off-centre while the phone app centred them. The goto
+  sent J2000 numbers; the firmware read them as JNow and centred that point,
+  off the object by the precession since J2000. Predicted shift vs offset
+  measured in frame: M92 9.1′/9.2′, M57 12.7′/12.6′, M1 22.4′/22.5′, M13
+  11.9′/8.2′ (the night's first goto, on a large cluster, so its annotation
+  centre is the least precise). The same mechanism made the solve appear to
+  "sit near the commanded target": it was the true field centre, in JNow —
+  numerically the J2000 numbers the goto had sent. On M1 the solve put the
+  field centre 25.3′ from M1's JNow position: the 22.4′ precession shift
+  plus ~4′ of residual mount pointing error. After this change expect only
+  that residual, a few arcminutes — pending live confirmation.
 - **v1.2.0** — three additive changes; no key removed or renamed, no unit or
   frame changed. **`get_status`** gained `mount_parked` and `mount_tracking`,
   each `bool` or `null`, read from the device's native `get_device_state`
@@ -131,11 +175,12 @@ to create state; their shapes are not pinned.
   ("no solve data yet"), up to ~30 s (the default `timeout_s`) — this call can
   now take that long to return. Its success payload gains `ra_deg`, `dec_deg`,
   `angle_deg`, `fov_deg`, `star_number`, `solve_duration_ms` and `waited_s`.
-  `ra_deg`/`dec_deg` are the solver's REPORTED position, not the field centre:
-  on fw 8.46 they sit near the commanded target even when the target is well
-  off-centre in the frame — offline image data showed the object ~23′
-  off-centre while the reported position was only ~4′ from it. For framing,
-  use `get_view_state.stack.target_px`, not these fields.
+  `ra_deg`/`dec_deg` are the solved field centre in JNow (equinox of date).
+  *Corrected in v1.3.0:* this entry first called them "the solver's REPORTED
+  position, not the field centre", because they sat near the commanded target
+  while the object sat ~23′ off-centre in the frame. That was J2000-vs-JNow
+  precession, not the solver — see v1.3.0. For framing, use
+  `get_view_state.stack.target_px`.
   A solve still in progress at `timeout_s` fails (`ok: false`) with `error`,
   `raw` (the last `get_solve_result` reply), `waited_s` (seconds spent polling)
   and `last_code` (the last native code seen, which is always 215 on this path).
@@ -152,12 +197,12 @@ to create state; their shapes are not pinned.
   an ended session. Its keys: `target_name`, `view_state`, `mode`, `stage`,
   `state`, `lp_filter`, `stacked`, `dropped`, `frame_errcode`, `solve_ra_deg`,
   `solve_dec_deg`, `annotate_state`, `target_px`, `target_radius_px`.
-  `solve_ra_deg`/`solve_dec_deg` carry the same reported-position-not-
-  field-centre caveat as `plate_solve.ra_deg`/`dec_deg` above. `target_px`
-  (the Annotate pixel position for the current target) is the VERIFIED
-  framing measure — it is what the offline image-data comparison above
-  confirmed against the true off-centre object, and what `plate_solve`'s own
-  caveat points callers to instead of its `ra_deg`/`dec_deg`.
+  `solve_ra_deg`/`solve_dec_deg` are the same JNow field centre as
+  `plate_solve.ra_deg`/`dec_deg` above (*corrected in v1.3.0*: this entry
+  first gave them the same "reported position, not the field centre"
+  caveat). `target_px` (the Annotate pixel position for the current target)
+  is the VERIFIED framing measure: averaged raw subs placed M1's nebula where
+  Annotate said it was (offline image data, 2026-09-24).
   **`qa_tier1`**'s `snapshot` gained `target_name` (string or `null`), read from
   `View.target_name` (or `Stack.target_name`). The trend baseline, which never
   reset before, now resets when a new stack starts: the target name changed
