@@ -6,6 +6,7 @@ All calls take an explicit ``when_utc`` so the results are reproducible.
 """
 
 from datetime import datetime
+from math import cos, radians
 
 import pytest
 
@@ -14,6 +15,8 @@ from seestar_mcp.planning.astro import (
     azalt_at,
     dark_window,
     field_rotation_rate,
+    j2000_to_jnow,
+    jnow_to_j2000,
     moon_illumination,
     observability,
     planning_when,
@@ -263,3 +266,126 @@ def test_observability_precomputed_window_skips_recompute_and_matches(monkeypatc
 
     assert calls == [], "observability must not recompute dark_window when it is given"
     assert obs == baseline
+
+
+# --- J2000 <-> JNow (goto epoch fix, 2026-09-24) -----------------------------
+# Live test 2026-09-23/24 (fw 8.46): objects imaged through the MCP landed
+# 8-23' off-centre while the phone app centred them. goto_target sent J2000
+# catalog coordinates, but the firmware works in JNow (mean equator and
+# equinox of date). The measured offsets matched J2000->JNow precession:
+# M92 9.1' predicted / 9.2' measured, M57 12.7'/12.6', M1 22.4'/22.5'.
+
+_M1_J2000 = (83.633, 22.017)  # catalog M1, degrees
+_EPOCH_ISO = "2026-09-24T04:00:00Z"
+
+
+def _sep_arcsec(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle separation of two (ra_deg, dec_deg) points, in arcseconds."""
+    from math import acos, degrees, sin
+
+    (ra1, d1), (ra2, d2) = a, b
+    c = sin(radians(d1)) * sin(radians(d2)) + cos(radians(d1)) * cos(
+        radians(d2)
+    ) * cos(radians(ra1 - ra2))
+    return degrees(acos(max(-1.0, min(1.0, c)))) * 3600.0
+
+
+def _dra_cos_arcmin(ra_new: float, ra_old: float, dec_deg: float) -> float:
+    """RA change (wrapped to +/-180 deg) times cos(dec), in arcminutes."""
+    d = (ra_new - ra_old + 180.0) % 360.0 - 180.0
+    return d * 60.0 * cos(radians(dec_deg))
+
+
+def test_j2000_to_jnow_m1_matches_the_measured_precession_offset():
+    """M1 at 2026-09-24T04:00Z: dRA*cos(dec) ~ +22.4' east, dDec ~ +1.0'."""
+    ra, dec = j2000_to_jnow(*_M1_J2000, _EPOCH_ISO)
+    assert _dra_cos_arcmin(ra, _M1_J2000[0], _M1_J2000[1]) == pytest.approx(
+        22.4, abs=0.2
+    )
+    assert (dec - _M1_J2000[1]) * 60.0 == pytest.approx(1.0, abs=0.2)
+    # And the total shift is the 22.4' predicted for the live-test table.
+    assert _sep_arcsec((ra, dec), _M1_J2000) / 60.0 == pytest.approx(22.4, abs=0.2)
+
+
+def test_jnow_to_j2000_m1_undoes_the_shift():
+    jnow = j2000_to_jnow(*_M1_J2000, _EPOCH_ISO)
+    back = jnow_to_j2000(*jnow, _EPOCH_ISO)
+    assert back[0] == pytest.approx(_M1_J2000[0], abs=1e-6)
+    assert back[1] == pytest.approx(_M1_J2000[1], abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "ra, dec",
+    [
+        (83.633, 22.017),  # M1
+        (283.396, 33.029),  # M57
+        (10.68, 41.27),  # M31
+        (202.4696, 47.1952),  # M51
+        (0.0, 0.0),
+        (359.9, -45.0),
+        (180.0, 85.0),
+        (45.0, -89.5),
+    ],
+)
+def test_j2000_jnow_round_trip_both_ways_better_than_0p1_arcsec(ra, dec):
+    fwd = j2000_to_jnow(ra, dec, _EPOCH_ISO)
+    assert _sep_arcsec(jnow_to_j2000(*fwd, _EPOCH_ISO), (ra, dec)) < 0.1
+    inv = jnow_to_j2000(ra, dec, _EPOCH_ISO)
+    assert _sep_arcsec(j2000_to_jnow(*inv, _EPOCH_ISO), (ra, dec)) < 0.1
+
+
+@pytest.mark.parametrize("dec", [85.0, 89.99, 90.0, -85.0, -90.0])
+def test_j2000_jnow_near_the_poles_never_raises(dec):
+    for convert in (j2000_to_jnow, jnow_to_j2000):
+        ra_out, dec_out = convert(123.4, dec, _EPOCH_ISO)
+        assert isinstance(ra_out, float) and isinstance(dec_out, float)
+        assert 0.0 <= ra_out < 360.0
+        assert -90.0 <= dec_out <= 90.0
+    # Dec 85 still precesses by a sane amount (under half a degree in 27 yr).
+    ra_now, dec_now = j2000_to_jnow(10.0, 85.0, _EPOCH_ISO)
+    assert _sep_arcsec((ra_now, dec_now), (10.0, 85.0)) / 60.0 < 30.0
+
+
+def test_j2000_to_jnow_wraps_ra_past_360_into_0_to_360():
+    # RA grows under precession here, so 359.9 deg J2000 lands just past 0.
+    ra, dec = j2000_to_jnow(359.9, 10.0, _EPOCH_ISO)
+    assert 0.0 <= ra < 1.0, f"RA must wrap to [0, 360), got {ra}"
+    assert _sep_arcsec((ra, dec), (359.9, 10.0)) / 60.0 == pytest.approx(22.1, abs=0.2)
+
+
+def test_jnow_to_j2000_wraps_ra_below_0_into_0_to_360():
+    ra, _dec = jnow_to_j2000(0.05, 10.0, _EPOCH_ISO)
+    assert 359.0 < ra < 360.0, f"RA must wrap to [0, 360), got {ra}"
+    ra0, _ = jnow_to_j2000(0.0, -30.0, _EPOCH_ISO)
+    assert 359.0 < ra0 < 360.0
+
+
+def test_j2000_jnow_is_deterministic_in_when_utc():
+    from astropy.time import Time
+
+    a = j2000_to_jnow(*_M1_J2000, _EPOCH_ISO)
+    assert j2000_to_jnow(*_M1_J2000, _EPOCH_ISO) == a
+    # The same instant in any accepted spelling gives the same answer.
+    b = j2000_to_jnow(*_M1_J2000, "2026-09-24T04:00:00+00:00")
+    c = j2000_to_jnow(*_M1_J2000, Time("2026-09-24T04:00:00", scale="utc"))
+    assert b == pytest.approx(a, abs=1e-9)
+    assert c == pytest.approx(a, abs=1e-9)
+    # A different instant gives a different (larger, later) shift.
+    later = j2000_to_jnow(*_M1_J2000, "2027-09-24T04:00:00Z")
+    assert _sep_arcsec(later, _M1_J2000) > _sep_arcsec(a, _M1_J2000) + 30.0
+
+
+def test_j2000_to_jnow_at_the_j2000_epoch_is_the_identity():
+    # J2000.0 = 2000-01-01T12:00:00 TT = 11:58:55.816 UTC: no precession yet.
+    ra, dec = j2000_to_jnow(*_M1_J2000, "2000-01-01T11:58:55.816")
+    assert _sep_arcsec((ra, dec), _M1_J2000) < 0.1
+
+
+@pytest.mark.parametrize(
+    "ra, dec",
+    [(83.6, 95.0), (83.6, -90.5), (float("nan"), 22.0), (83.6, float("inf"))],
+)
+def test_j2000_jnow_rejects_out_of_range_input_with_value_error(ra, dec):
+    for convert in (j2000_to_jnow, jnow_to_j2000):
+        with pytest.raises(ValueError):
+            convert(ra, dec, _EPOCH_ISO)

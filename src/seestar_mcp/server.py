@@ -52,6 +52,8 @@ from .native_reply import (
 from .planning.astro import (
     azalt_at,
     dark_window,
+    j2000_to_jnow,
+    jnow_to_j2000,
     moon_illumination,
     observability,
     planning_when,
@@ -286,6 +288,14 @@ class SeestarController:
         every framing/drop check needed a scratch script to dig
         ``stacked_frame``/``dropped_frame``/``frame_errcode`` and the Annotate
         pixel position out of the raw payload by hand.
+
+        ``stack`` also carries ``solve_ra_j2000_deg``/``solve_dec_j2000_deg``:
+        the JNow solve position (``solve_ra_deg``/``solve_dec_deg``) precessed
+        to J2000 at the time of this call, for comparison with the catalog
+        (goto-epoch finding, live test 2026-09-24). Both are ``None`` when the
+        solve position is. They are added HERE, after the pure
+        :func:`_summarize_view_state`, so that parser (shared with the slot
+        watcher) stays free of the clock and astropy.
         """
         try:
             self.provenance.log_call(tool="get_view_state", args={})
@@ -293,6 +303,17 @@ class SeestarController:
             if (bad := _native_fail(state)) is not None:
                 return bad
             observing, stack = _summarize_view_state(state)
+            if stack is not None:
+                ra_j2000, dec_j2000 = _j2000_or_none(
+                    stack["solve_ra_deg"],
+                    stack["solve_dec_deg"],
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                stack = {
+                    **stack,
+                    "solve_ra_j2000_deg": ra_j2000,
+                    "solve_dec_j2000_deg": dec_j2000,
+                }
             return {
                 "ok": True,
                 "view_state": state,
@@ -316,7 +337,34 @@ class SeestarController:
         This commands telescope MOTION. It derives a deterministic session id
         (target + UTC timestamp, unless ``session_id`` is supplied), opens a
         :class:`SessionManifest`, and issues the native goto.
+
+        ``ra``/``dec`` are J2000 degrees (the catalog's frame), and the reply
+        echoes them unchanged. The firmware works in JNow, so they are
+        precessed to the equinox of the current instant before the slew;
+        ``ra_jnow_deg``/``dec_jnow_deg`` (what was sent) and ``epoch_utc`` (the
+        instant used) are returned beside them and recorded in the manifest.
+        Goto-epoch finding (live test 2026-09-23/24, fw 8.46): sending J2000
+        numbers left objects 8-23' off-centre, and the offsets matched the
+        J2000->JNow precession (M92 9.1'/9.2', M57 12.7'/12.6', M1 22.4'/22.5'
+        predicted/measured). A position that cannot be precessed (non-finite,
+        ``|dec| > 90``) fails ``ok: false`` before any session state or motion.
         """
+        # Tool layer: the only place "now" is read for the precession epoch
+        # (planning/ stays clock-free, per CLAUDE.md).
+        epoch_utc = datetime.now(timezone.utc).isoformat()
+        try:
+            ra_jnow, dec_jnow = j2000_to_jnow(ra, dec, epoch_utc)
+        except Exception as exc:  # noqa: BLE001 - never raise; never slew blind
+            return {
+                "ok": False,
+                "error": (
+                    "cannot precess the J2000 target position to JNow, so no "
+                    f"goto was sent: {exc}"
+                ),
+                "target": name,
+                "ra": ra,
+                "dec": dec,
+            }
         try:
             if session_id is None:
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -349,7 +397,13 @@ class SeestarController:
                 config_summary=self._config_summary(),
             )
             self.manifest.set_meta(
-                target=name, ra=ra, dec=dec, lp_filter=bool(use_lp_filter)
+                target=name,
+                ra=ra,
+                dec=dec,
+                ra_jnow_deg=ra_jnow,
+                dec_jnow_deg=dec_jnow,
+                epoch_utc=epoch_utc,
+                lp_filter=bool(use_lp_filter),
             )
             # HARDWARE-VERIFIED (2026-07-12): the firmware's ``target_ra_dec``
             # expects RA in HOURS and Dec in degrees. ``ra``/``dec`` arrive in
@@ -357,11 +411,14 @@ class SeestarController:
             # Passing RA in degrees makes the goto SILENTLY no-op: it returns
             # code 0 but the mount never slews (RA out of range) and drops to
             # ContinuousExposure. This one line broke the whole 2026-07-12 run.
+            # Goto-epoch finding (live test 2026-09-24): the firmware also wants
+            # JNow, not J2000 -- sending J2000 left objects 8-23' off-centre --
+            # so the JNow position computed above is what is sent.
             result = await self.alpaca.method_sync(
                 "iscope_start_view",
                 {
                     "mode": "star",
-                    "target_ra_dec": [ra / 15.0, dec],
+                    "target_ra_dec": [ra_jnow / 15.0, dec_jnow],
                     "target_name": name,
                     "lp_filter": bool(use_lp_filter),
                 },
@@ -375,6 +432,9 @@ class SeestarController:
                 target=name,
                 ra=ra,
                 dec=dec,
+                ra_jnow_deg=ra_jnow,
+                dec_jnow_deg=dec_jnow,
+                epoch_utc=epoch_utc,
                 lp_filter=bool(use_lp_filter),
             )) is not None:
                 return bad
@@ -384,6 +444,9 @@ class SeestarController:
                 "target": name,
                 "ra": ra,
                 "dec": dec,
+                "ra_jnow_deg": ra_jnow,
+                "dec_jnow_deg": dec_jnow,
+                "epoch_utc": epoch_utc,
                 "lp_filter": bool(use_lp_filter),
                 "result": result,
                 "warning": _native_warning(result),
@@ -485,14 +548,24 @@ class SeestarController:
         On success the additive fields ``ra_deg``/``dec_deg``/``angle_deg``/
         ``fov_deg``/``star_number``/``solve_duration_ms`` sit next to the
         unchanged ``solve_result``, plus ``waited_s`` (how long this call
-        actually spent polling). ``ra_deg``/``dec_deg``/``angle_deg`` are the
-        *solver's reported position* (RA converted from hours to degrees), not
-        the field centre: on fw 8.46 this reported position sits near the
-        commanded target even when the object is well off-centre in the frame
-        — M1's nebula sat ~23' off-centre in the averaged raw subs (matching
-        the live-stack Annotate position) while the solved ``ra_dec`` sat only
-        ~4' from the M1 catalog position. For framing, use the stack Annotate
-        pixel position (``get_view_state``), not these fields.
+        actually spent polling). ``ra_deg``/``dec_deg`` are the solved FIELD
+        CENTRE in JNow (mean equator and equinox of date; RA converted from
+        hours to degrees). ``ra_j2000_deg``/``dec_j2000_deg`` are the same point
+        precessed to J2000 at the time of this call (see
+        :func:`_j2000_or_none`), for comparison with the J2000 catalog; both
+        are ``None`` when the solve has no position.
+
+        CORRECTED (goto-epoch finding, live test 2026-09-24): these fields were
+        documented earlier that day as "the solver's reported position, not the
+        field centre", because on fw 8.46 the solve sat near the commanded
+        target while M1's nebula sat ~23' off-centre in the frame. The
+        explanation is precession: the goto sent M1's J2000 numbers, the
+        firmware read them as JNow and centred THAT point, and the solve
+        reported it back in JNow -- numerically near the J2000 numbers sent.
+        The live-test offsets matched J2000->JNow precession (M92 9.1'/9.2',
+        M57 12.7'/12.6', M1 22.4'/22.5' predicted/measured). To judge where
+        the target sits in the frame, the stack Annotate pixel position
+        (``get_view_state`` -> ``stack.target_px``) is still the direct measure.
         """
         try:
             # FIRMWARE-DEPENDENT: solve method names.
@@ -539,12 +612,20 @@ class SeestarController:
 
             if (bad := _native_fail(result)) is not None:
                 return bad
+            fields = _extract_solve_fields(result)
+            ra_j2000, dec_j2000 = _j2000_or_none(
+                fields["ra_deg"],
+                fields["dec_deg"],
+                datetime.now(timezone.utc).isoformat(),
+            )
             return {
                 "ok": True,
                 "solve_result": result,
                 "warning": _native_warning(started) or _native_warning(result),
                 "waited_s": waited_s,
-                **_extract_solve_fields(result),
+                **fields,
+                "ra_j2000_deg": ra_j2000,
+                "dec_j2000_deg": dec_j2000,
             }
         except AlpacaError as exc:
             return _err(exc)
@@ -1758,14 +1839,19 @@ def _extract_solve_fields(value: Any) -> dict:
     ``None`` for that field rather than a crash, mirroring
     :func:`_extract_focus_pos`.
 
-    These are the *solver's reported position*, not the field centre.
-    HARDWARE-OBSERVED (fw 8.46, live test 2026-09-24): this reported position
-    sits near the commanded target even when the object is well off-centre in
-    the frame — M1's nebula sat ~23' off-centre in the averaged raw subs
-    (matching the live-stack Annotate position) while the solved ``ra_dec``
-    sat only ~4' from the M1 catalog position, and the FITS header RA/DEC
-    ~1'. For framing, use the stack Annotate pixel position
-    (``get_view_state``), not these fields.
+    ``ra_deg``/``dec_deg`` are the solved field centre in JNow (mean equator
+    and equinox of date), exactly as the device reports it; this parser stays
+    pure, and :meth:`SeestarController.plate_solve` adds the J2000 equivalent
+    (``ra_j2000_deg``/``dec_j2000_deg``) via :func:`_j2000_or_none`.
+
+    CORRECTED (goto-epoch finding, live test 2026-09-24): an earlier note here
+    said this was "the solver's reported position, not the field centre",
+    because the solve (and the FITS header RA/DEC) sat within a few arcminutes
+    of the commanded target while M1's nebula sat ~23' off-centre. The goto
+    had sent J2000 numbers that the firmware treated as JNow, so the field
+    centre in JNow numerically matched them; the measured offsets matched
+    J2000->JNow precession (M92 9.1'/9.2', M57 12.7'/12.6', M1 22.4'/22.5'
+    predicted/measured).
     """
     fields: dict[str, Any] = {
         "ra_deg": None,
@@ -1793,6 +1879,34 @@ def _extract_solve_fields(value: Any) -> dict:
     fields["star_number"] = nested.get("star_number")
     fields["solve_duration_ms"] = nested.get("duration_ms")
     return fields
+
+
+def _j2000_or_none(
+    ra_deg: Any, dec_deg: Any, when_utc: str
+) -> tuple[float | None, float | None]:
+    """J2000 ``(ra_deg, dec_deg)`` of a JNow solve position, or ``(None, None)``.
+
+    Precesses the device's JNow plate-solve position (equinox of ``when_utc``)
+    back to J2000 with :func:`~seestar_mcp.planning.astro.jnow_to_j2000`, so a
+    caller can compare it with the J2000 catalog (goto-epoch finding, live
+    test 2026-09-24). ``when_utc`` is the tool layer's "now": the solve's own
+    capture instant is seconds to minutes earlier, and precession moves about
+    50" per YEAR, so the difference is far below a pixel.
+
+    Never raises: a missing or non-numeric coordinate yields ``(None, None)``,
+    and so does one the precession rejects (non-finite, ``|dec| > 90``) -- the
+    raw JNow fields still carry whatever the device reported.
+    """
+
+    def _num(v: Any) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    if not (_num(ra_deg) and _num(dec_deg)):
+        return (None, None)
+    try:
+        return jnow_to_j2000(ra_deg, dec_deg, when_utc)
+    except Exception:  # noqa: BLE001 - advisory field, never fatal
+        return (None, None)
 
 
 def _native_fail(value: Any, **extra: Any) -> dict | None:
@@ -2066,8 +2180,12 @@ async def get_view_state() -> dict:
     the Annotate framing pixel position for the current target); it is
     ``null`` only when there is no View at all, and stays present -- with its
     final counts -- for an ended session. ``solve_ra_deg``/``solve_dec_deg``
-    are the solver's REPORTED position, not the field centre; for framing use
-    ``stack.target_px``.
+    are the plate-solved field centre in JNow (equinox of date, the frame the
+    Seestar works in); ``solve_ra_j2000_deg``/``solve_dec_j2000_deg`` are the
+    same point in J2000, for comparison with the catalog, and are ``null``
+    when there is no solve position (corrected 2026-09-24: the earlier
+    "reported position" caveat was J2000-vs-JNow precession). To judge where
+    the target sits in the frame use ``stack.target_px``.
     """
     return await get_controller().get_view_state()
 
@@ -2079,7 +2197,11 @@ async def goto_target(
     """Slew the telescope to a target and start a session.
 
     SIDE EFFECT: commands telescope MOTION and opens a new session manifest.
-    ``ra``/``dec`` are the target coordinates; ``use_lp_filter`` toggles the
+    ``ra``/``dec`` are the target's J2000 catalog coordinates in degrees. The
+    Seestar firmware expects JNow (equinox of date), so the server precesses
+    them to the current instant before slewing. The reply echoes ``ra``/``dec``
+    (J2000) and adds ``ra_jnow_deg``/``dec_jnow_deg`` (the position actually
+    sent) and ``epoch_utc`` (the instant used). ``use_lp_filter`` toggles the
     light-pollution filter.
     """
     return await get_controller().goto_target(name, ra, dec, use_lp_filter)
@@ -2117,11 +2239,13 @@ async def plate_solve() -> dict:
     """Plate-solve the current field and return the solution. Read-only pointing.
 
     Polls the device while the solve is in progress, up to ~30s, so this call
-    can take that long to return. ``ra_deg``/``dec_deg`` are the solver's
-    reported position (RA converted from hours to degrees). On fw 8.46 that
-    position sits near the COMMANDED target, NOT the field centre, even when
-    the object is well off-centre in the frame. Never judge framing from
-    them: use ``get_view_state`` → ``stack.target_px``.
+    can take that long to return. ``ra_deg``/``dec_deg`` are the solved field
+    centre in JNow (equinox of date, the frame the Seestar works in; RA
+    converted from hours to degrees). ``ra_j2000_deg``/``dec_j2000_deg`` are
+    the same point in J2000, for comparison with the catalog, and are ``null``
+    when the solve has no position (corrected 2026-09-24: the earlier
+    "reported position" caveat was J2000-vs-JNow precession). To judge where
+    the target sits in the frame, use ``get_view_state`` → ``stack.target_px``.
     """
     return await get_controller().plate_solve()
 

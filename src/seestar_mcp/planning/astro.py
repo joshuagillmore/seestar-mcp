@@ -18,6 +18,9 @@ The main public entry points:
   sampled across the dark window: the bankable clean time in the sweet band
   ``[min_altitude_deg, field_rotation_ceiling_deg]``, moon geometry, and the
   field-rotation-limited usable sub length. Never raises.
+* :func:`j2000_to_jnow` / :func:`jnow_to_j2000` — FK5 precession between the
+  J2000 catalog and the equinox of date the Seestar firmware works in (goto
+  epoch finding, live test 2026-09-24).
 """
 
 from __future__ import annotations
@@ -25,11 +28,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import cos, radians
+from math import cos, isfinite, radians
 
 import astropy.units as u
 import numpy as np
 from astropy.coordinates import (
+    FK5,
     AltAz,
     EarthLocation,
     SkyCoord,
@@ -131,6 +135,73 @@ def field_rotation_rate(lat_deg: float, az_deg: float, alt_deg: float) -> float:
     if abs(cos_alt) < 1e-6:
         cos_alt = 1e-6 if cos_alt >= 0 else -1e-6
     return abs(15.041 * cos(radians(lat_deg)) * cos(radians(az_deg)) / cos_alt)
+
+
+# --- J2000 <-> JNow -----------------------------------------------------------
+# Goto-epoch finding (live test 2026-09-23/24, fw 8.46): objects imaged through
+# the MCP landed 8-23' off-centre while the phone app centred them. goto_target
+# sent J2000 catalog coordinates, but the Seestar works in JNow (mean equator
+# and equinox of date), and the measured offsets matched J2000->JNow precession
+# (M92 9.1' predicted / 9.2' measured, M57 12.7'/12.6', M1 22.4'/22.5').
+#
+# FK5 with an equinox of date is precession only, and it is analytic: it needs
+# no IERS table, so it works on the air-gapped Jetson and under the test
+# suite's offline IERS configuration. TETE/CIRS/AltAz would add nutation and
+# aberration (under 1') but need Earth-orientation data, so they are NOT used.
+
+
+def _precess(
+    ra_deg: float, dec_deg: float, from_frame: FK5, to_frame: FK5
+) -> tuple[float, float]:
+    """Move one FK5 position between equinoxes; RA normalised to [0, 360).
+
+    Raises :class:`ValueError` for a non-finite coordinate or ``|dec| > 90``:
+    a position that cannot exist must not be precessed into a plausible one.
+    """
+    ra, dec = float(ra_deg), float(dec_deg)
+    if not (isfinite(ra) and isfinite(dec)) or abs(dec) > 90.0:
+        raise ValueError(
+            f"not a valid sky position: ra={ra_deg!r} deg, dec={dec_deg!r} deg"
+        )
+    coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=from_frame)
+    moved = coord.transform_to(to_frame)
+    ra_out = float(moved.ra.deg) % 360.0
+    if ra_out >= 360.0:  # a tiny negative float can round up to exactly 360.0
+        ra_out = 0.0
+    return ra_out, float(moved.dec.deg)
+
+
+def j2000_to_jnow(
+    ra_deg: float, dec_deg: float, when_utc: str | Time
+) -> tuple[float, float]:
+    """Precess a J2000 position (degrees) to JNow at ``when_utc``.
+
+    JNow here is FK5 at the mean equator and equinox of ``when_utc`` --
+    ``FK5(equinox=Time(when_utc))``: precession only. Nutation and aberration
+    (under 1') are deliberately left out; see the block comment above.
+    Deterministic in ``when_utc`` (no clock read). RA comes back in [0, 360).
+    Exact inverse of :func:`jnow_to_j2000` to far better than 0.1".
+    Raises :class:`ValueError` for a non-finite input or ``|dec| > 90``.
+    """
+    return _precess(
+        ra_deg, dec_deg, FK5(equinox="J2000"), FK5(equinox=_to_time(when_utc))
+    )
+
+
+def jnow_to_j2000(
+    ra_deg: float, dec_deg: float, when_utc: str | Time
+) -> tuple[float, float]:
+    """Precess a JNow position (degrees, equinox of ``when_utc``) back to J2000.
+
+    The inverse of :func:`j2000_to_jnow`: ``FK5(equinox=Time(when_utc))`` to
+    ``FK5(equinox="J2000")``. Used to put the Seestar's plate-solve position
+    (reported in JNow) beside the J2000 catalog for comparison. Deterministic
+    in ``when_utc``; RA comes back in [0, 360). Raises :class:`ValueError` for a
+    non-finite input or ``|dec| > 90``.
+    """
+    return _precess(
+        ra_deg, dec_deg, FK5(equinox=_to_time(when_utc)), FK5(equinox="J2000")
+    )
 
 
 def azalt_at(

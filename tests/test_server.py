@@ -591,9 +591,37 @@ async def test_get_view_state_tool_description_mentions_the_summary():
 # --- Regression tests for the 2026-07-12 live-session bugs ---
 
 
-async def test_goto_target_sends_ra_in_hours():
+def _pin_now(monkeypatch, iso: str) -> None:
+    """Pin the tool layer's ``datetime.now(timezone.utc)`` to ``iso``.
+
+    Same approach as ``_freeze_now`` in ``tests/test_planning_tools.py``: patch
+    the module-level ``server_mod.datetime`` name, not the stdlib module, which
+    astropy reads for itself.
+    """
+    import datetime as datetime_module
+
+    frozen = datetime_module.datetime.fromisoformat(iso)
+
+    class _FrozenDatetime(datetime_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen.astimezone(tz) if tz else frozen
+
+    monkeypatch.setattr(server_mod, "datetime", _FrozenDatetime)
+
+
+#: The goto-epoch test clock (live test night 2026-09-23/24).
+_PINNED_NOW = "2026-09-24T04:00:00+00:00"
+
+
+async def test_goto_target_sends_ra_in_hours(monkeypatch):
     # HARDWARE: firmware's target_ra_dec wants RA in HOURS; the tool takes
     # catalog DEGREES and must divide by 15. Passing degrees = silent no-slew.
+    # UPDATED deliberately for the goto-epoch fix (2026-09-24): the firmware
+    # also wants JNow, so the tool precesses the caller's J2000 position to
+    # the pinned instant FIRST, then converts RA to hours. These are M51's
+    # JNow numbers at 2026-09-24T04:00Z (J2000 202.4696, 47.1952).
+    _pin_now(monkeypatch, _PINNED_NOW)
     alpaca = AsyncMock()
     alpaca.method_sync.return_value = {"result": 0}
     ctrl = _controller_with_mock_alpaca(alpaca)
@@ -601,8 +629,253 @@ async def test_goto_target_sends_ra_in_hours():
     call = alpaca.method_sync.await_args
     assert call.args[0] == "iscope_start_view"
     ra_hours, dec = call.args[1]["target_ra_dec"]
-    assert abs(ra_hours - 202.4696 / 15.0) < 1e-6  # RA -> hours
-    assert abs(dec - 47.1952) < 1e-6               # Dec stays degrees
+    assert abs(ra_hours - 202.7504450 / 15.0) < 1e-6  # JNow RA -> hours
+    assert abs(dec - 47.0578413) < 1e-6               # JNow Dec stays degrees
+
+
+# --- goto epoch: J2000 in, JNow to the firmware (live test 2026-09-24) --------
+# Objects imaged through the MCP landed 8-23' off-centre while the phone app
+# centred them. goto_target sent J2000 catalog coordinates, but the firmware
+# works in JNow; the offsets matched J2000->JNow precession (M92 9.1'/9.2',
+# M57 12.7'/12.6', M1 22.4'/22.5' predicted/measured).
+
+
+async def test_goto_target_precesses_j2000_to_jnow_before_the_slew(monkeypatch):
+    from seestar_mcp.planning.astro import j2000_to_jnow
+
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = {"result": 0, "code": 0}
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    result = await ctrl.goto_target("M1", 83.633, 22.017, session_id="epoch")
+
+    ra_jnow, dec_jnow = j2000_to_jnow(83.633, 22.017, _PINNED_NOW)
+    call = alpaca.method_sync.await_args
+    assert call.args[0] == "iscope_start_view"
+    assert call.args[1]["target_ra_dec"] == [ra_jnow / 15.0, dec_jnow]
+    # Pinned independently of the helper: M1's JNow position at this instant.
+    assert ra_jnow == pytest.approx(84.0353091, abs=1e-6)
+    assert dec_jnow == pytest.approx(22.0329798, abs=1e-6)
+
+    assert result["ok"] is True
+    # The caller's J2000 contract is unchanged: ra/dec echo what was passed.
+    assert result["ra"] == 83.633
+    assert result["dec"] == 22.017
+    # Additive: what was actually sent, and the instant it was precessed to.
+    assert result["ra_jnow_deg"] == ra_jnow
+    assert result["dec_jnow_deg"] == dec_jnow
+    assert result["epoch_utc"] == _PINNED_NOW
+
+
+async def test_goto_target_records_the_jnow_it_sent_in_the_manifest(
+    tmp_path, monkeypatch
+):
+    from seestar_mcp.config import Settings
+
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = {"result": 0, "code": 0}
+    ctrl = SeestarController(
+        settings=Settings(manifest_dir=tmp_path / "m"),
+        provenance=MagicMock(),
+        alpaca=alpaca,
+        data=AsyncMock(),
+        tier1=AsyncMock(),
+    )
+    result = await ctrl.goto_target("M1", 83.633, 22.017, session_id="epoch-m")
+    meta = ctrl.manifest.meta
+    assert meta["ra"] == 83.633 and meta["dec"] == 22.017
+    assert meta["ra_jnow_deg"] == result["ra_jnow_deg"]
+    assert meta["dec_jnow_deg"] == result["dec_jnow_deg"]
+    assert meta["epoch_utc"] == _PINNED_NOW
+
+
+async def test_goto_target_native_error_still_reports_the_jnow_attempted(
+    monkeypatch,
+):
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = "Error: Exceeded allotted wait time for result"
+    ctrl = _controller_with_mock_alpaca(alpaca)
+    result = await ctrl.goto_target("M1", 83.633, 22.017, session_id="epoch-err")
+    assert result["ok"] is False
+    assert result["ra"] == 83.633
+    assert result["ra_jnow_deg"] == pytest.approx(84.0353091, abs=1e-6)
+    assert result["epoch_utc"] == _PINNED_NOW
+
+
+@pytest.mark.parametrize(
+    "ra, dec", [(83.6, 95.0), (83.6, -91.0), (float("nan"), 22.0)]
+)
+async def test_goto_target_rejects_an_unconvertible_position_without_moving(
+    ra, dec, monkeypatch
+):
+    # Never-raise: the precession rejects an impossible position; the tool must
+    # return ok:false and issue NO native command (no motion, no session).
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = {"result": 0, "code": 0}
+    ctrl = _controller_with_mock_alpaca(alpaca)
+    result = await ctrl.goto_target("bad", ra, dec, session_id="bad")
+    assert result["ok"] is False
+    assert "J2000" in result["error"]
+    alpaca.method_sync.assert_not_awaited()
+    assert ctrl.manifest is None
+    assert ctrl.session_id is None
+
+
+async def test_goto_target_tool_description_states_j2000_in_and_jnow_sent():
+    tools = {t.name: t for t in await mcp.list_tools()}
+    desc = tools["goto_target"].description or ""
+    assert "J2000" in desc
+    assert "JNow" in desc
+    for key in ("ra_jnow_deg", "dec_jnow_deg", "epoch_utc"):
+        assert key in desc, f"goto_target description must name {key}"
+
+
+async def test_plate_solve_adds_the_j2000_of_the_jnow_solve(tmp_path, monkeypatch):
+    from seestar_mcp.planning.astro import jnow_to_j2000
+
+    _pin_now(monkeypatch, _PINNED_NOW)
+    ctrl = _polling_solve_ctl(tmp_path, _ACCEPTED_START_SOLVE, [dict(_SOLVED_846_REPLY)])
+    _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve()
+
+    assert result["ok"] is True
+    # The JNow fields are unchanged ...
+    assert result["ra_deg"] == pytest.approx(5.572092 * 15)
+    assert result["dec_deg"] == pytest.approx(22.068264)
+    # ... and the same point in J2000 sits beside them.
+    ra_j2000, dec_j2000 = jnow_to_j2000(5.572092 * 15, 22.068264, _PINNED_NOW)
+    assert result["ra_j2000_deg"] == ra_j2000
+    assert result["dec_j2000_deg"] == dec_j2000
+    # Pinned independently: the live M1 solve, back in J2000.
+    assert ra_j2000 == pytest.approx(83.1790198, abs=1e-6)
+    assert dec_j2000 == pytest.approx(22.0511127, abs=1e-6)
+
+
+async def test_plate_solve_j2000_is_null_when_the_solve_has_no_position(
+    tmp_path, monkeypatch
+):
+    _pin_now(monkeypatch, _PINNED_NOW)
+    no_position = {
+        "jsonrpc": "2.0",
+        "method": "get_solve_result",
+        "result": {"fov": [0.71, 1.27], "focal_len": 250},
+        "code": 0,
+    }
+    ctrl = _polling_solve_ctl(tmp_path, _ACCEPTED_START_SOLVE, [no_position])
+    _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve()
+
+    assert result["ok"] is True
+    assert result["ra_deg"] is None and result["dec_deg"] is None
+    assert result["ra_j2000_deg"] is None
+    assert result["dec_j2000_deg"] is None
+
+
+async def test_plate_solve_j2000_is_null_for_an_impossible_solve_position(
+    tmp_path, monkeypatch
+):
+    # Never-raise: a malformed device position (Dec 95) degrades to null.
+    _pin_now(monkeypatch, _PINNED_NOW)
+    bad = {
+        "jsonrpc": "2.0",
+        "method": "get_solve_result",
+        "result": {"ra_dec": [5.57, 95.0]},
+        "code": 0,
+    }
+    ctrl = _polling_solve_ctl(tmp_path, _ACCEPTED_START_SOLVE, [bad])
+    _mock_sleep(monkeypatch)
+
+    result = await ctrl.plate_solve()
+
+    assert result["ok"] is True
+    assert result["dec_deg"] == 95.0
+    assert result["ra_j2000_deg"] is None
+    assert result["dec_j2000_deg"] is None
+
+
+async def test_get_view_state_stack_adds_the_j2000_of_the_solve(monkeypatch):
+    from seestar_mcp.planning.astro import jnow_to_j2000
+
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = REAL_VIEW_STATE_STACKING
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    stack = (await ctrl.get_view_state())["stack"]
+
+    ra_j2000, dec_j2000 = jnow_to_j2000(18.89505 * 15, 33.015196, _PINNED_NOW)
+    assert stack["solve_ra_deg"] == 18.89505 * 15  # JNow, unchanged
+    assert stack["solve_ra_j2000_deg"] == ra_j2000
+    assert stack["solve_dec_j2000_deg"] == dec_j2000
+    assert ra_j2000 == pytest.approx(283.1773151, abs=1e-6)
+    assert dec_j2000 == pytest.approx(32.9809599, abs=1e-6)
+    # Every other stack key is exactly what the pure summary produced.
+    _observing, pure = server_mod._summarize_view_state(REAL_VIEW_STATE_STACKING)
+    assert {k: v for k, v in stack.items() if not k.endswith("_j2000_deg")} == pure
+
+
+async def test_get_view_state_stack_j2000_is_null_without_a_solve(monkeypatch):
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = PARKED_ENDED_VIEW_STATE  # no PlateSolve
+    ctrl = _controller_with_mock_alpaca(alpaca)
+
+    stack = (await ctrl.get_view_state())["stack"]
+
+    assert stack["solve_ra_deg"] is None
+    assert stack["solve_ra_j2000_deg"] is None
+    assert stack["solve_dec_j2000_deg"] is None
+
+
+async def test_get_view_state_fresh_boot_stack_stays_null_with_the_epoch_fix(
+    monkeypatch,
+):
+    _pin_now(monkeypatch, _PINNED_NOW)
+    alpaca = AsyncMock()
+    alpaca.method_sync.return_value = FRESH_BOOT_VIEW_STATE
+    ctrl = _controller_with_mock_alpaca(alpaca)
+    result = await ctrl.get_view_state()
+    assert result["ok"] is True
+    assert result["stack"] is None
+
+
+def test_summarize_view_state_stays_pure_without_j2000_keys():
+    # The J2000 augmentation lives in server.get_view_state; the shared pure
+    # parser (also used by the slot watcher) must not grow a clock or astropy.
+    import ast
+
+    import seestar_mcp.native_reply as native_reply
+
+    _observing, stack = native_reply._summarize_view_state(REAL_VIEW_STATE_STACKING)
+    assert "solve_ra_j2000_deg" not in stack
+    tree = ast.parse(inspect.getsource(native_reply))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert not imported & {"astropy", "datetime", "time"}, imported
+
+
+async def test_solve_tool_descriptions_say_jnow_field_centre_and_j2000():
+    tools = {t.name: t for t in await mcp.list_tools()}
+    solve = tools["plate_solve"].description or ""
+    assert "JNow" in solve
+    assert "ra_j2000_deg" in solve and "dec_j2000_deg" in solve
+    view = tools["get_view_state"].description or ""
+    assert "JNow" in view
+    assert "solve_ra_j2000_deg" in view and "solve_dec_j2000_deg" in view
+    for desc in (solve, view):
+        assert "not the field centre" not in desc.lower(), (
+            "superseded 2026-09-24: the solve IS the field centre, in JNow"
+        )
 
 
 async def test_set_dew_heater_uses_pi_output_set2():
@@ -1355,8 +1628,12 @@ async def test_plate_solve_tool_description_states_wait_and_degrees():
     assert "30" in desc, "must state the call may take up to ~30s"
     assert "degrees" in desc.lower(), "must state RA is returned in degrees"
     # Final review G4 (2026-09-24): the caveat is stated inline, not deferred
-    # to a Python docstring an MCP client never sees.
-    assert "NOT the field centre" in desc
+    # to a Python docstring an MCP client never sees. UPDATED deliberately for
+    # the goto-epoch finding (2026-09-24): the old caveat ("NOT the field
+    # centre") was wrong -- the solve is the field centre in JNow, and the
+    # description must say so and name the J2000 fields.
+    assert "NOT the field centre" not in desc
+    assert "JNow" in desc and "ra_j2000_deg" in desc
     assert "stack.target_px" in desc, "must name the framing field to use instead"
     assert "SeestarController" not in desc
 

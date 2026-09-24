@@ -149,8 +149,13 @@ def _summarize_view_state(state: Any) -> tuple[bool, dict | None]:
     ``state`` (``Stack.state``), ``lp_filter``, ``stacked``
     (``Stack.stacked_frame``), ``dropped`` (``Stack.dropped_frame``),
     ``frame_errcode``, ``solve_ra_deg``/``solve_dec_deg`` (from
-    ``Stack.PlateSolve.ra_dec``, RA hours x 15 -- the solver's REPORTED
-    position, not the field centre, per ``_extract_solve_fields``),
+    ``Stack.PlateSolve.ra_dec``, RA hours x 15 -- the solved field centre in
+    JNow, the equinox of date; corrected by the goto-epoch finding of
+    2026-09-24, which traced the earlier "reported position, not the field
+    centre" caveat to J2000-vs-JNow precession, see
+    ``server._extract_solve_fields``; ``server.get_view_state`` adds the J2000
+    equivalent as ``solve_ra_j2000_deg``/``solve_dec_j2000_deg``, so this
+    parser stays free of the clock and astropy),
     ``annotate_state``, and ``target_px``/``target_radius_px`` -- the
     ``Stack.Annotate`` annotation whose ``names`` match ``target_name`` after
     :func:`_normalize_annotation_name`, or ``None`` when there is no match.
