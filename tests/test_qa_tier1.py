@@ -133,6 +133,12 @@ def test_parse_view_state_real_firmware_nested_stack():
     assert out["solve_ok"] is True
 
 
+def test_parse_view_state_extracts_target_name():
+    """target_name lives at View level (not Stack) -- see REAL_VIEW_STATE."""
+    out = _parse_view_state(REAL_VIEW_STATE)
+    assert out["target_name"] == "M27 Dumbbell Nebula"
+
+
 def test_parse_view_state_initialise_phase_no_stack():
     """Init phase has stage 'Initialise' and no Stack -> no counts, no crash."""
     payload = {
@@ -221,6 +227,15 @@ async def test_poll_real_firmware_payload_renders_status_line():
     assert "stacked 2" in line
 
 
+async def test_poll_extracts_target_name():
+    alpaca = AsyncMock()
+    alpaca.method_sync.side_effect = [REAL_VIEW_STATE, {}]
+    mon = Tier1Monitor(alpaca)
+    snap = await mon.poll()
+
+    assert snap.target_name == "M27 Dumbbell Nebula"
+
+
 async def test_poll_survives_one_failed_subcall():
     alpaca = AsyncMock()
     alpaca.method_sync.side_effect = [
@@ -287,6 +302,52 @@ def test_check_stacking_stalled():
     mon = Tier1Monitor(AsyncMock())
     mon.history = [_snap(stacked=50), _snap(stacked=50)]
     assert "stacking_stalled" in mon.check()
+
+
+# --- target-switch resets the trend baseline (live test 2026-09-24) -------
+# Consecutive polls across a `goto_target` gave stacked 301 then 24 on the new
+# target; the monitor compared them directly (stacked_delta=-274) and flagged
+# a false `stacking_stalled`.  A decrease in `stacked` -- or, when the
+# firmware reports one, a change of target -- must start a fresh baseline.
+
+
+def test_check_stacking_stalled_not_flagged_across_target_switch():
+    mon = Tier1Monitor(AsyncMock())
+    mon.history = [_snap(stacked=300), _snap(stacked=26)]
+
+    flags = mon.check()
+    assert "stacking_stalled" not in flags
+    assert mon.trends()["stacked_delta"] is None
+
+    # A later poll within the SAME (new) stack trends normally.
+    mon.history.append(_snap(stacked=94))
+    trends = mon.trends()
+    assert trends["stacked_delta"] == 68
+    assert "stacking_stalled" not in mon.check()
+
+
+def test_check_target_name_change_resets_baseline_even_without_decrease():
+    """A reported target change starts a new stack even if counts happen to rise."""
+    mon = Tier1Monitor(AsyncMock())
+    mon.history = [
+        _snap(stacked=300, target_name="M27 Dumbbell Nebula"),
+        _snap(stacked=310, target_name="M13"),
+    ]
+
+    assert mon.trends()["stacked_delta"] is None
+    assert "stacking_stalled" not in mon.check()
+
+    # Same (new) target continuing to stack trends normally.
+    mon.history.append(_snap(stacked=340, target_name="M13"))
+    assert mon.trends()["stacked_delta"] == 30
+
+
+def test_check_target_name_none_does_not_force_a_reset():
+    """An absent target name on either side proves nothing -- no reset."""
+    mon = Tier1Monitor(AsyncMock())
+    mon.history = [_snap(stacked=50), _snap(stacked=54)]
+    assert mon.trends()["stacked_delta"] == 4
+    assert "stacking_stalled" not in mon.check()
 
 
 def test_check_rejection_spike():
