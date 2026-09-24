@@ -50,6 +50,10 @@ Refinement (stacking/preview) lives in a separate repo, `seestar-refine` (split 
     `projects.py`, `obstructions.py` (learned mask), `autonomous.py` (guardrails + scheduler).
   - `run_state.py` — persisted tri-valued run state, so a restarted server can answer
     "is a run underway, and what is it doing?" without inference.
+  - `native_reply.py` — pure parsers for native replies (`_native_error`, `_summarize_view_state`),
+    shared by `server.py` and `slot_watch.py` so both read `observing` identically.
+  - `slot_watch.py` — the shipped slot watcher (`python -m seestar_mcp.slot_watch`): polls only
+    `get_view_state` and prints one line per stacking event for a Claude Code Monitor.
   - `config.py` (pydantic-settings, `SEESTAR_` env prefix), `provenance.py`, `secrets.py`.
 
 ## Non-negotiable conventions

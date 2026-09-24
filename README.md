@@ -165,6 +165,8 @@ make lint   # or: uv run ruff check src tests
 
 Never invoke a bare `python`; always go through `uv run` so the locked environment is used.
 
+**Slot watcher:** `PYTHONIOENCODING=utf-8 uv --directory /path/to/SeeStar-AI run python -m seestar_mcp.slot_watch --duration 1740 --every 60` polls `get_view_state` and prints one line per event: stage change, drop burst, stall, session ended, error, or every 60 frames. It is the command to run under a Claude Code Monitor (`timeout_ms` 1800000; re-arm when it prints "watch window ended"), beside the session heartbeat and never instead of it. Filter it with `grep -a` because names can be non-ASCII. Full usage is in the docstring of [`src/seestar_mcp/slot_watch.py`](src/seestar_mcp/slot_watch.py).
+
 `uv sync` installs everything. For a runtime-only install use `uv sync --no-dev`.
 
 ## Configuration
